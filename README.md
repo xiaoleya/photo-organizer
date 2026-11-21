@@ -69,12 +69,13 @@
 ## 下载与运行
 
 安装包和绿色版在 [Releases](../../releases) 里，仓库本身只放源码。
+附件名是英文的（GitHub 会清洗中文附件名），装完仍是「照片整理」。
 
 ### Windows 安装包
-运行 `照片整理-安装程序.exe`，一路下一步即可。
+运行 `PhotoOrganizer-Setup-v1.0.0-beta.exe`，一路下一步即可。
 
 ### 绿色版
-解压 `照片整理-绿色版.zip`，保持目录结构：
+解压 `PhotoOrganizer-Portable-v1.0.0-beta.zip`，保持目录结构：
 
 ```
 照片整理-绿色版/
