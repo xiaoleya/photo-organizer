@@ -1,0 +1,135 @@
+/* ==========================================================================
+   设计令牌：iOS / 现代卡片式风格（参考图2）
+   --------------------------------------------------------------------------
+   核心语言：
+     · 大圆角        卡片 20-24px，控件 12-14px，胶囊 999px
+     · 柔和阴影      多层、低透明度、大扩散，不用硬边框
+     · 渐变卡片      品牌色渐变 + 半透明白色叠加
+     · 分组背景      页面底色 vs 卡片白色，两层，靠阴影分层
+     · 彩色图标      每个功能一个柔和色块底 + 同色系图标
+   ========================================================================== */
+
+:root {
+  /* ---------- 品牌色（沿用前面的蓝色 #4EA9FF 谱系，更符合 iOS 习惯） ---------- */
+  --brand-50:  #eef6ff;
+  --brand-100: #d9ecff;
+  --brand-200: #b7dbff;
+  --brand-300: #8ac6ff;
+  --brand-400: #5aaefe;
+  --brand-500: #3b95f7;
+  --brand-600: #2478e0;
+  --brand-700: #1b5fbb;
+
+  /* ---------- 渐变（图2 的彩色卡片） ---------- */
+  --grad-blue:   linear-gradient(135deg, #4f8cf7 0%, #7b5cf0 100%);
+  --grad-violet: linear-gradient(135deg, #8b5cf6 0%, #d946ef 100%);
+  --grad-pink:   linear-gradient(135deg, #f472b6 0%, #fb923c 100%);
+  --grad-green:  linear-gradient(135deg, #34d399 0%, #22d3ee 100%);
+  --grad-amber:  linear-gradient(135deg, #fbbf24 0%, #f97316 100%);
+
+  /* ---------- 语义色 ---------- */
+  --success: #22c55e;
+  --warning: #f59e0b;
+  --danger:  #ef4444;
+  --info:    #3b82f6;
+
+  /* ---------- 圆角刻度 ---------- */
+  --r-xs: 8px;
+  --r-sm: 10px;
+  --r-md: 14px;
+  --r-lg: 20px;
+  --r-xl: 24px;
+  --r-pill: 999px;
+
+  /* ---------- 间距 ---------- */
+  --sp-1: 4px;  --sp-2: 8px;  --sp-3: 12px; --sp-4: 16px;
+  --sp-5: 20px; --sp-6: 24px; --sp-8: 32px; --sp-10: 40px;
+
+  /* ---------- 字号（iOS 尺度） ---------- */
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-base: 13px;
+  --fs-md: 14px;
+  --fs-lg: 16px;
+  --fs-xl: 20px;
+  --fs-2xl: 26px;
+  --fs-3xl: 32px;
+
+  /* ---------- 字体 ---------- */
+  --font-ui: 'Segoe UI Variable Text', 'Segoe UI', 'Microsoft YaHei UI',
+             'PingFang SC', -apple-system, system-ui, sans-serif;
+  --font-display: 'Segoe UI Variable Display', 'Segoe UI',
+                  'Microsoft YaHei UI', 'PingFang SC', system-ui, sans-serif;
+
+  /* ---------- 布局 ---------- */
+  --rail-w: 72px;          /* 最左侧图标栏 */
+  --panel-w: 300px;        /* 第二列（筛选/详情） */
+  --header-h: 80px;
+
+  /* ---------- 动效 ---------- */
+  --ease: cubic-bezier(.4, 0, .2, 1);
+  --dur: .18s;
+}
+
+/* 强调色渐变：由主题切换脚本动态覆盖 */
+:root { --grad-accent: var(--grad-blue); }
+
+/* ==========================================================================
+   深色（默认）
+   ========================================================================== */
+:root,
+[data-theme='dark'] {
+  color-scheme: dark;
+
+  --page-bg:      #0f1115;
+  --surface:      #191c22;
+  --surface-2:    #21252d;
+  --surface-3:    #2a2f38;
+  --surface-hover:#242932;
+
+  --text-primary:   #f2f5f9;
+  --text-secondary: #a8b2c0;
+  --text-tertiary:  #6f7a8a;
+  --text-inverse:   #0f1115;
+
+  --line:       rgba(255, 255, 255, .07);
+  --line-strong:rgba(255, 255, 255, .13);
+
+  /* 阴影：深色下用更强的黑色 + 内发光模拟层次 */
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.4);
+  --shadow-md: 0 4px 16px rgba(0,0,0,.45), 0 1px 3px rgba(0,0,0,.3);
+  --shadow-lg: 0 12px 40px rgba(0,0,0,.55), 0 2px 8px rgba(0,0,0,.4);
+  --shadow-glow: 0 8px 32px rgba(59,149,247,.28);
+
+  --tint: rgba(59,149,247,.14);
+  --tint-strong: rgba(59,149,247,.22);
+}
+
+/* ==========================================================================
+   浅色
+   ========================================================================== */
+[data-theme='light'] {
+  color-scheme: light;
+
+  --page-bg:      #f4f6fa;
+  --surface:      #ffffff;
+  --surface-2:    #f7f9fc;
+  --surface-3:    #eef2f8;
+  --surface-hover:#f2f5fa;
+
+  --text-primary:   #111827;
+  --text-secondary: #5b6577;
+  --text-tertiary:  #98a1b2;
+  --text-inverse:   #ffffff;
+
+  --line:       rgba(17, 24, 39, .07);
+  --line-strong:rgba(17, 24, 39, .13);
+
+  --shadow-sm: 0 1px 2px rgba(16,24,40,.06);
+  --shadow-md: 0 4px 16px rgba(16,24,40,.08), 0 1px 3px rgba(16,24,40,.05);
+  --shadow-lg: 0 12px 40px rgba(16,24,40,.12), 0 2px 8px rgba(16,24,40,.06);
+  --shadow-glow: 0 8px 32px rgba(59,149,247,.22);
+
+  --tint: rgba(59,149,247,.10);
+  --tint-strong: rgba(59,149,247,.18);
+}

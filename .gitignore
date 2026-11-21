@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller / 构建产物
+build/
+dist/
+dist_onefile/
+*.spec.bak
+
+# Node / Vite
+node_modules/
+ui/dist/
+.vite/
+
+# Tauri / Rust
+ui/src-tauri/target/
+ui/src-tauri/gen/
+
+# 应用运行时数据
+*.db
+*.db-wal
+*.db-shm
+bridge_access.log
+thumb_error.log
+restored_*.jpg
+
+# 测试与调试截图
+_final_ui.png
+_fix1.png
+_md3.png
+_sqlerr.txt
+_sqlout.txt
+demo_out/
+gui_home/
+
+# 系统
+.DS_Store
+Thumbs.db
+desktop.ini
