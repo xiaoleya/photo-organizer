@@ -1,6 +1,6 @@
 [package]
 name = "photo-organizer"
-version = "1.0.0"
+version = "1.1.0"
 description = "照片整理"
 authors = ["owner"]
 edition = "2021"
@@ -11,9 +11,13 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
-tauri-plugin-shell = "2"
+rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# 引擎（纯 Rust，不再依赖 Python 后端进程）
+po-core = { path = "../../crates/po-core" }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "gif", "tiff"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

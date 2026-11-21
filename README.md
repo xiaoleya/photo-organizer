@@ -4,7 +4,9 @@
 
 > 默认所有照片数据只保存在本机 `%LOCALAPPDATA%\OldPhotoOrganizer\`，不会联网上传。
 
-> ⚠️ **当前是 v1.0.0 测试版**：功能与界面仍在调整，建议先用一份照片副本试跑。安装包请到 [Releases](../../releases) 下载。
+> ⚠️ **当前是 v1.1.0 测试版**：功能与界面仍在调整，建议先用一份照片副本试跑。安装包请到 [Releases](../../releases) 下载。
+>
+> v1.1 起引擎已从 Python 重写为 Rust 并并入主程序：单进程、无需 Python 运行时，安装包 4.1 MB。
 
 ---
 
@@ -72,22 +74,15 @@
 附件名是英文的（GitHub 会清洗中文附件名），装完仍是「照片整理」。
 
 ### Windows 安装包
-运行 `PhotoOrganizer-Setup-v1.0.0-beta.exe`，一路下一步即可。
+运行 `PhotoOrganizer-Setup-v1.1.0-beta.exe`，一路下一步即可。
 
 ### 绿色版
-解压 `PhotoOrganizer-Portable-v1.0.0-beta.zip`，保持目录结构：
+解压 `PhotoOrganizer-Portable-v1.1.0-beta.zip`，双击 `照片整理.exe` 即可。
 
-```
-照片整理-绿色版/
-├── 照片整理.exe
-├── 使用说明.txt
-└── backend/
-    └── photo-backend.exe
-```
+> v1.1 起引擎已并入主程序，**不再需要 `backend/photo-backend.exe`**，
+> 也不再依赖 Python 运行时，解压后只有一个 exe。
 
-双击 `照片整理.exe` 即可。`backend` 文件夹必须与主程序在同一目录，不能删。
-
-第一次启动约 3~5 秒（之后 1~2 秒）。打开后：
+第一次启动约 1~2 秒。打开后：
 1. 点顶部「选择文件夹」
 2. 点「开始扫描」
 3. 扫描完成后点「确定，去看照片」
@@ -97,60 +92,96 @@
 ## 从源码运行
 
 ### 环境
-- Python 3.12+
+- Rust 1.80+
 - Node.js 20+
-- Rust（通过 Tauri 构建桌面程序）
+- （可选）MSVC Build Tools
 
-### 后端开发
-```bash
-pip install pillow numpy
-python -m opo.bridge          # 本地 HTTP API，端口 18921
-```
-
-### 前端开发
+### 桌面应用
 ```bash
 cd ui
 npm install
-npm run dev                   # Vite 开发服务器
-npm run tauri dev             # Tauri 桌面应用（需 Rust）
+npm run tauri dev             # 开发模式
+npm run tauri build           # 打包安装包
 ```
 
-### 打包
+### 引擎 CLI
+引擎（`crates/po-core`）可脱离界面单独使用：
+
 ```bash
-# 前端
-cd ui && npm run build
+cd 源码
+cargo build --release
 
-# 后端（单文件）
-pyinstaller bridge.spec --noconfirm --clean
+# 扫描 → 分析 → 打标 → 地点 → 事件 → 去重
+./target/release/po run D:\照片
 
-# 桌面安装包
-cd ui && npm run tauri build
+# 其他命令
+./target/release/po stats              # 统计
+./target/release/po list --limit 50    # 列出照片
+./target/release/po organize --dest out --scheme year_month
+./target/release/po rollback           # 撤销上次整理
+./target/release/po restore --out fixed --preset 标准修复
+./target/release/po report --html r.html --csv p.csv
+./target/release/po check              # 校验资源库完整性
 ```
 
----
+### 测试
+```bash
+cd 源码
+cargo test --workspace
+cd ui/src-tauri && cargo test           # 命令层
+```
 
 ## 项目结构
 
 ```
 .
-├── opo/                     Python 后端：扫描、分析、去重、修复、归档、HTTP API
-│   ├── bridge.py            HTTP 服务（前端所有接口）
-│   ├── scanner.py           扫描与分析
-│   ├── imaging.py           质量指标、缩略图、感知哈希
-│   ├── classify.py          自动打标、聚类、地点回填
-│   ├── geo.py               经纬度反查城市
-│   ├── restore.py           修复算法流水线
-│   ├── organizer.py         归档计划与执行
-│   └── library.py           SQLite 数据层
+├── crates/
+│   ├── po-core/             引擎（lib，无 UI 依赖）
+│   │   ├── config.rs        路径、默认设置、settings.json
+│   │   ├── util.rs          日期解析、安全文件名、sha1
+│   │   ├── exif.rs          EXIF / GPS 解析
+│   │   ├── imaging.rs       质量指标、缩略图、感知哈希
+│   │   ├── library.rs       SQLite 数据层
+│   │   ├── scanner.rs       目录遍历与并行分析
+│   │   ├── classify.rs      打标、事件聚类、去重
+│   │   ├── geo.rs           离线城市表与地点推断
+│   │   ├── restore.rs       修复算法与预设
+│   │   ├── organizer.rs     归档计划、执行与回滚
+│   │   ├── report.rs        HTML / CSV 导出
+│   │   └── pipeline.rs      全流程编排与进度
+│   └── po-cli/              命令行工具（`po`）
 ├── ui/                      Vue 3 + Tauri 前端
-│   ├── src/                 页面与组件
+│   ├── src/
 │   │   ├── views/           照片库、时间轴、地点、收藏、重复、质量、修复、归档、设置
 │   │   ├── components/      PhotosPanel、TitleBar、Icon 等
-│   │   └── styles/          设计令牌
-│   └── src-tauri/           Rust 壳（无边框窗口、sidecar 管理）
-├── tests/                   后端测试
-└── bridge.spec              PyInstaller 单文件后端打包配置
+│   │   ├── api.js           Tauri invoke 封装
+│   │   └── thumb.js         图片 URL（自定义 `po://` 协议）
+│   └── src-tauri/
+│       ├── src/main.rs      窗口、`po://` 协议、命令注册
+│       └── src/commands.rs  命令层（原 HTTP 接口）
+├── samples/                 测试样图
+├── tools/make_samples.py    样图生成器（需要 Pillow + numpy）
+└── Cargo.toml               workspace
 ```
+
+---
+
+## 架构演进（v1.1）
+
+v1.0 是「Tauri + Vue 前端 + Python HTTP 后端（`photo-backend.exe` sidecar）」。
+v1.1 把引擎整体重写为 Rust 并并入主程序：
+
+| | v1.0 | v1.1 |
+| --- | --- | --- |
+| 引擎 | Python（Pillow + numpy） | Rust |
+| 进程 | 2 个（主程序 + 后端 sidecar） | 1 个 |
+| 数据通道 | 本机 HTTP（端口 18921，26 个 REST 接口） | 进程内 `tauri::command` |
+| 图片 | `/thumb` `/photo` HTTP | `po://local/thumb` 自定义协议 |
+| 运行时依赖 | Python 3.12 + WebView2 | 仅 WebView2 |
+| 启动耗时 | 3~5 秒（冷启） | 1~2 秒 |
+
+**兼容性**：SQLite schema、`settings.json` 键名、缩略图缓存键（`thumb_key`）
+都与 v1.0 完全一致，升级后可直接复用原有索引库，无需重新扫描。
 
 ---
 

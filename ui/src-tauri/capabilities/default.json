@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "权限配置：允许本地 HTTP API、对话框、shell sidecar 与窗口控制",
+  "description": "照片整理权限配置：窗口控制与文件夹选择对话框",
   "windows": ["main"],
   "permissions": [
     "core:default",
@@ -17,9 +17,6 @@
     "core:window:allow-set-focus",
     "core:webview:default",
     "core:app:default",
-    "shell:allow-spawn",
-    "shell:allow-kill",
-    "shell:allow-execute",
     "dialog:allow-open"
   ]
 }

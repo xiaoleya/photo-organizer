@@ -1,118 +1,139 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod commands;
+
 use std::path::PathBuf;
-use std::process::Child;
+
+use commands::AppState;
+use std::sync::Arc;
+use tauri::http::{Request, Response, StatusCode};
 use tauri::Manager;
 
-/// 后端子进程句柄（sidecar 的 CommandChild 或 std Child 二选一）
-enum BackendChild {
-    Sidecar(tauri_plugin_shell::process::CommandChild),
-    Std(std::process::Child),
-}
+/// 图片走自定义协议 `po://local/thumb?id=1&size=480`。
+///
+/// 原来这些请求走本地 HTTP 后端（`127.0.0.1:18921`），
+/// 现在引擎在进程内，直接读字节返回，少一个进程和一次网络往返。
+fn handle_po_protocol(request: Request<Vec<u8>>, state: &AppState) -> Response<Vec<u8>> {
+    let not_found = || {
+        Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Vec::new())
+            .unwrap()
+    };
 
-impl BackendChild {
-    /// kill 会消费自身：sidecar 的 kill(self) 需要所有权。
-    /// sidecar 的 kill 只是发信号，子进程可能还在退出中；
-    /// 因此再按镜像名补一刀，确保不留残影。
-    fn kill(self) {
-        match self {
-            BackendChild::Sidecar(c) => {
-                let _ = c.kill();
+    let uri = request.uri().clone();
+    let path = uri.path().trim_start_matches('/').to_string();
+    let query: std::collections::HashMap<String, String> = uri
+        .query()
+        .map(|q| {
+            q.split('&')
+                .filter_map(|kv| {
+                    let mut it = kv.splitn(2, '=');
+                    let k = it.next()?.to_string();
+                    let v = it.next().unwrap_or("");
+                    Some((k, percent_decode(v)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let id = query.get("id").and_then(|s| s.parse::<i64>().ok());
+    let file_path = query.get("path").cloned();
+    let size = query
+        .get("size")
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(480);
+
+    let Some(resolved) = commands::resolve_image_path(state, id, file_path.as_deref()) else {
+        return not_found();
+    };
+
+    let (body, mime) = match path.as_str() {
+        "thumb" => match commands::serve_thumb(state, &resolved, size) {
+            Some(d) => (d, "image/jpeg"),
+            None => return not_found(),
+        },
+        "photo" => match std::fs::read(&resolved) {
+            Ok(d) => {
+                let mime = mime_of(&resolved);
+                (d, mime)
             }
-            BackendChild::Std(mut c) => {
-                let _ = c.kill();
-                let _ = c.wait();
+            Err(_) => {
+                return Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Vec::new())
+                    .unwrap()
+            }
+        },
+        _ => return not_found(),
+    };
+
+    // 缩略图可以长缓存（键里含 mtime+size，内容变了 URL 会变）；
+    // 原图必须短缓存，否则重置索引后 id 复用会显示旧图。
+    let cache = if path == "thumb" {
+        "public, max-age=604800"
+    } else {
+        "no-store, must-revalidate"
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", mime)
+        .header("Cache-Control", cache)
+        .header("Access-Control-Allow-Origin", "*")
+        .body(body)
+        .unwrap_or_else(|_| Response::new(Vec::new()))
+}
+
+fn mime_of(p: &PathBuf) -> &'static str {
+    match p
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("jpg") | Some("jpeg") | Some("jpe") | Some("jfif") => "image/jpeg",
+        Some("png") => "image/png",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        Some("tif") | Some("tiff") => "image/tiff",
+        _ => "application/octet-stream",
+    }
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+                if let Ok(v) = u8::from_str_radix(hex, 16) {
+                    out.push(v);
+                    i += 3;
+                    continue;
+                }
+                out.push(bytes[i]);
+                i += 1;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
             }
         }
-        #[cfg(target_os = "windows")]
-        {
-            // 兜底：静默结束所有同名进程
-            let _ = std::process::Command::new("taskkill")
-                .args(["/F", "/IM", "photo-backend.exe"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .creation_flags_no_window()
-                .spawn();
-        }
     }
+    String::from_utf8_lossy(&out).to_string()
 }
 
-/// 让子进程不弹黑框
-trait NoWindow {
-    fn creation_flags_no_window(&mut self) -> &mut Self;
-}
-
-impl NoWindow for std::process::Command {
-    fn creation_flags_no_window(&mut self) -> &mut Self {
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            self.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        }
-        self
-    }
-}
-
-struct Backend(std::sync::Mutex<Option<BackendChild>>);
-
-/// 后端 exe 查找：**优先 exe 自身所在目录**。
-/// 双击启动时 current_dir 往往是 C:\Windows\System32 之类，
-/// 之前用 cwd 找后端所以找不到，前端就报"后端未启动"。
-/// 后端由 Tauri sidecar 机制内嵌在主程序里，
-/// 运行时会自动解压到应用数据目录，路径由 shell 插件解析。
-/// 这里保留一个兜底：万一 sidecar 不可用，再按文件系统找。
-fn find_backend_fallback() -> Option<PathBuf> {
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(d) = exe.parent() {
-            dirs.push(d.to_path_buf());
-            dirs.push(d.join("binaries"));
-            dirs.push(d.join("_up_"));
-            if let Some(p) = d.parent() {
-                dirs.push(p.to_path_buf());
-            }
-        }
-    }
-    for d in dirs {
-        let p = d.join("photo-backend.exe");
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    None
-}
-
-#[cfg(target_os = "windows")]
-fn bind_to_parent(child: &Child) {
-    // 用 Job Object 把后端绑定到本进程：主进程退出时系统连带终止后端。
-    use std::os::windows::io::AsRawHandle;
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn CreateJobObjectW(attrs: *mut u8, name: *const u16) -> *mut u8;
-        fn SetInformationJobObject(job: *mut u8, class: u32, info: *const u8, len: u32) -> i32;
-        fn AssignProcessToJobObject(job: *mut u8, process: *mut u8) -> i32;
-    }
-
-    let handle = child.as_raw_handle() as *mut u8;
-    unsafe {
-        let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
-        if !job.is_null() {
-            let mut info = [0u8; 144];
-            let flags: u32 = 0x2000; // KILL_ON_JOB_CLOSE
-            info[16..20].copy_from_slice(&flags.to_le_bytes());
-            let _ = SetInformationJobObject(job, 9, info.as_ptr(), info.len() as u32);
-            let _ = AssignProcessToJobObject(job, handle);
-        }
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn bind_to_parent(_child: &Child) {}
-
+/// 用系统默认程序打开文件或文件夹。
 #[tauri::command]
 fn open_path(path: String) -> Result<(), String> {
-    // 用系统默认程序打开文件或文件夹
     #[cfg(target_os = "windows")]
     {
         std::process::Command::new("explorer")
@@ -129,26 +150,26 @@ fn open_path(path: String) -> Result<(), String> {
 }
 
 /// 用 Windows 现代文件资源管理器对话框选文件夹。
+///
 /// Tauri 的 dialog 插件在 Windows 上默认走旧式 SHBrowseForFolder，
 /// 外观是老式树形框；这里改用 COM 的 IFileOpenDialog + FOS_PICKFOLDERS，
-/// 得到和「另存为」完全一致的现代资源管理器界面（带地址栏、搜索、侧边栏）。
+/// 得到和「另存为」一致的现代资源管理器界面。
 #[tauri::command]
 async fn pick_folder() -> Option<String> {
     #[cfg(target_os = "windows")]
     {
-        use windows::core::{Interface, PCWSTR};
+        use windows::core::PCWSTR;
         use windows::Win32::System::Com::{
             CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
             COINIT_APARTMENTTHREADED,
         };
         use windows::Win32::UI::Shell::{
-            FileOpenDialog, IFileOpenDialog, IShellItem, FOS_FORCEFILESYSTEM,
-            FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, SIGDN_FILESYSPATH,
+            FileOpenDialog, IFileOpenDialog, IShellItem, FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST,
+            FOS_PICKFOLDERS, SIGDN_FILESYSPATH,
         };
 
         unsafe {
             let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-            // RPC_E_CHANGED_MODE 表示线程已初始化成别的套间模型，可继续用
             let need_uninit = hr.is_ok();
 
             let result = (|| -> Option<String> {
@@ -163,7 +184,6 @@ async fn pick_folder() -> Option<String> {
                 dialog.SetTitle(PCWSTR(title.as_ptr())).ok()?;
                 dialog.SetOkButtonLabel(PCWSTR(ok_label.as_ptr())).ok()?;
 
-                // 显示模态对话框
                 dialog.Show(None).ok()?;
 
                 let item: IShellItem = dialog.GetResult().ok()?;
@@ -186,93 +206,72 @@ async fn pick_folder() -> Option<String> {
 }
 
 fn main() {
+    // 固定大小的解码线程池：一次加载几百张缩略图时，
+    // 不能每个请求都 spawn 一个线程（会瞬间冒出几百个线程），
+    // 也不能在主线程同步解码（会卡死 UI）。
+    let pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+                    .clamp(2, 8),
+            )
+            .thread_name(|i| format!("po-thumb-{i}"))
+            .build()
+            .expect("缩略图线程池创建失败"),
+    );
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_shell::init())
-        .invoke_handler(tauri::generate_handler![open_path, pick_folder])
-        .setup(|app| {
-            // 依次尝试：sidecar（安装版/内嵌）→ 同目录 exe（绿色版）→ 二进制子目录
-            use tauri_plugin_shell::ShellExt;
-
-            let mut started = false;
-
-            // 1) sidecar
-            if let Ok(cmd) = app.shell().sidecar("photo-backend") {
-                if let Ok((_rx, child)) = cmd.spawn() {
-                    app.manage(Backend(std::sync::Mutex::new(
-                        Some(BackendChild::Sidecar(child)))));
-                    started = true;
-                }
-            }
-
-            // 2) 回退：exe 同目录的 photo-backend.exe
-            if !started {
-                if let Ok(exe) = std::env::current_exe() {
-                    if let Some(dir) = exe.parent() {
-                        let candidates = [
-                            dir.join("backend").join("photo-backend.exe"),
-                            dir.join("photo-backend.exe"),
-                            dir.join("binaries").join("photo-backend.exe"),
-                            dir.join("_up_").join("photo-backend.exe"),
-                        ];
-                        for bp in candidates {
-                            if bp.exists() {
-                                match std::process::Command::new(&bp)
-                                    .current_dir(dir)
-                                    .spawn()
-                                {
-                                    Ok(child) => {
-                                        app.manage(Backend(std::sync::Mutex::new(
-                                            Some(BackendChild::Std(child)))));
-                                        started = true;
-                                        break;
-                                    }
-                                    Err(_) => continue,
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if !started {
-                eprintln!("[opo] 后端未能启动：sidecar 与本地 exe 都不可用");
-            }
-            Ok(())
+        .manage(AppState::new())
+        // 必须用异步版：同步协议回调跑在 WebView2 的 IPC 线程上，
+        // 一次加载几百张缩略图时会在那里同步解码 JPEG，
+        // 把整个线程堵死 —— 表现就是图片全黑 + 界面卡顿无响应。
+        .register_asynchronous_uri_scheme_protocol("po", move |ctx, request, responder| {
+            let state = ctx.app_handle().state::<AppState>().inner().clone();
+            pool.spawn(move || {
+                responder.respond(handle_po_protocol(request, &state));
+            });
         })
-        .on_window_event(|window, event| {
-            // CloseRequested 在用户点 ✕ 时最先触发，比 Destroyed 更可靠
-            if let tauri::WindowEvent::CloseRequested { .. } = event {
-                if let Some(state) = window.try_state::<Backend>() {
-                    if let Ok(mut guard) = state.0.lock() {
-                        if let Some(child) = guard.take() {
-                            child.kill();
-                        }
-                    }
-                }
-            }
-            if let tauri::WindowEvent::Destroyed = event {
-                if let Some(state) = window.try_state::<Backend>() {
-                    if let Ok(mut guard) = state.0.lock() {
-                        if let Some(child) = guard.take() {
-                            child.kill();
-                        }
-                    }
-                }
-            }
-        })
-        .build(tauri::generate_context!())
-        .expect("error while building tauri application")
-        .run(|app_handle, event| {
-            // RunEvent::Exit 在主进程真正结束前触发，这是最后可靠的清理点
-            if let tauri::RunEvent::Exit = event {
-                if let Some(state) = app_handle.try_state::<Backend>() {
-                    if let Ok(mut guard) = state.0.lock() {
-                        if let Some(child) = guard.take() {
-                            child.kill();
-                        }
-                    }
-                }
-            }
-        });
+        .invoke_handler(tauri::generate_handler![
+            // 原生能力
+            open_path,
+            pick_folder,
+            // 查询
+            commands::ping,
+            commands::get_stats,
+            commands::get_photos,
+            commands::get_photo,
+            commands::get_tags,
+            commands::get_timeline,
+            commands::get_places,
+            commands::get_events,
+            commands::get_duplicates,
+            commands::get_roots,
+            commands::get_settings,
+            commands::get_restore_presets,
+            commands::get_scan_progress,
+            commands::get_startup_state,
+            // 写操作
+            commands::save_settings,
+            commands::add_root,
+            commands::remove_root,
+            commands::scan_start,
+            commands::scan_sync,
+            commands::set_favorite,
+            commands::reclassify,
+            commands::backfill_places,
+            commands::reset_index,
+            commands::clean_duplicates,
+            commands::delete_photos,
+            // 修复
+            commands::restore_one,
+            commands::restore_apply,
+            commands::restore_batch,
+            // 整理
+            commands::organize,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
 }

@@ -1,0 +1,20 @@
+[package]
+name = "po-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "photo organizer engine"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+regex.workspace = true
+sha1.workspace = true
+rusqlite.workspace = true
+rayon.workspace = true
+image.workspace = true
+fast_image_resize.workspace = true
+kamadak-exif.workspace = true

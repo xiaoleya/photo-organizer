@@ -182,7 +182,54 @@ onMounted(async () => {
   window.addEventListener('opo:index-reset', refreshStats)
   window.addEventListener('opo:scan-done', refreshStats)
   window.addEventListener('opo:roots-changed', refreshFolders)
+  // 上次的记录还在就问一句，避免用户以为照片"丢了"或"重复了"
+  await checkStartup()
 })
+
+/* ---------------- 启动询问 ---------------- */
+const startupAsk = ref(false)
+const startupInfo = ref({ total: 0, analyzed: 0, timeText: '' })
+
+function fmtTime(ts) {
+  if (!ts) return '未知'
+  const d = new Date(ts * 1000)
+  const p = n => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
+         `${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+async function checkStartup() {
+  const r = await api.startupState()
+  if (!r || !r.has_previous) return
+  startupInfo.value = {
+    total: r.total || 0,
+    analyzed: r.analyzed || 0,
+    timeText: fmtTime(r.last_scan),
+  }
+  startupAsk.value = true
+}
+
+function keepPreviousScan() {
+  startupAsk.value = false
+  refreshStats()
+  refreshFolders()
+}
+
+async function clearPreviousScan() {
+  startupAsk.value = false
+  resetting.value = true
+  // keepRoots=true：保留照片目录清单，清完直接能重新扫
+  const r = await api.resetIndex(true)
+  resetting.value = false
+  if (r && r.ok) {
+    topMsg.value = `已清除 ${r.removed || 0} 条扫描记录，点「开始扫描」重新建立索引`
+    await refreshStats()
+    await refreshFolders()
+    window.dispatchEvent(new CustomEvent('opo:index-reset'))
+  } else {
+    topMsg.value = '清除失败，请稍后再试'
+  }
+}
 
 async function addFolderTop() {
   if (picking.value || topBusy.value) return
@@ -411,6 +458,34 @@ watch(current, (v) => { if (v === 'library' || v === 'places') refreshStats() })
           </button>
         </div>
       </header>
+
+      <!-- 启动询问：上次扫描记录还在，问要不要清掉 -->
+      <div v-if="startupAsk" class="scan-mask">
+        <div class="scan-dialog startup-dialog">
+          <div class="scan-title">
+            <Icon name="clock" :size="18" />
+            发现上次的扫描记录
+          </div>
+          <div class="scan-detail">
+            上次扫描：<b>{{ startupInfo.timeText }}</b><br>
+            共 <b>{{ startupInfo.total }}</b> 张照片
+            <template v-if="startupInfo.analyzed < startupInfo.total">
+              （已分析 {{ startupInfo.analyzed }} 张）
+            </template>
+          </div>
+          <div class="startup-tip">
+            清除后需要重新扫描才能看照片；原始照片文件不受影响。
+          </div>
+          <div class="scan-actions startup-actions">
+            <button class="btn" @click="keepPreviousScan">
+              保留，直接看
+            </button>
+            <button class="btn btn-danger" @click="clearPreviousScan">
+              <Icon name="trash" :size="16" /> 清除并重新开始
+            </button>
+          </div>
+        </div>
+      </div>
 
       <!-- 扫描进度弹窗：进行中显示进度，完成后转确认态 -->
       <div v-if="scanOpen" class="scan-mask">
@@ -704,6 +779,29 @@ watch(current, (v) => { if (v === 'library' || v === 'places') refreshStats() })
   font-size: var(--fs-lg); font-weight: 600; margin-bottom: 18px;
 }
 .scan-title.done { color: var(--success); }
+
+/* 启动询问弹窗 */
+.startup-dialog { text-align: left; }
+.startup-dialog .scan-title { justify-content: flex-start; margin-bottom: 14px; }
+.startup-dialog .scan-detail { line-height: 1.9; margin-bottom: 12px; }
+.startup-tip {
+  font-size: var(--fs-xs); color: var(--text-secondary);
+  line-height: 1.6; margin-bottom: 18px;
+  padding: 8px 10px; border-radius: var(--r-sm);
+  background: rgba(245,158,11,.10);
+  border-left: 2px solid var(--warning);
+}
+.startup-actions {
+  justify-content: flex-end; gap: 10px; display: flex;
+}
+.btn-danger {
+  background: rgba(239,68,68,.14);
+  color: var(--danger);
+  border: 1px solid rgba(239,68,68,.35);
+}
+.btn-danger:hover {
+  background: rgba(239,68,68,.24);
+}
 .scan-spin {
   width: 16px; height: 16px; border-radius: 50%; flex: none;
   border: 2px solid var(--tint-strong); border-top-color: var(--brand-400);

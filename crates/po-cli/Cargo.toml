@@ -1,0 +1,26 @@
+﻿[package]
+name = "po-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "po"
+path = "src/main.rs"
+
+# 开发期诊断工具（对齐 Python 版指标、打印样图数值）
+[[bin]]
+name = "po-diag"
+path = "src/bin/diag.rs"
+
+[[bin]]
+name = "po-compare"
+path = "src/bin/compare.rs"
+
+[dependencies]
+image.workspace = true
+fast_image_resize.workspace = true
+po-core = { path = "../po-core" }
+anyhow.workspace = true
+serde_json.workspace = true
+chrono.workspace = true

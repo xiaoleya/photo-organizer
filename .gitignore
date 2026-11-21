@@ -17,6 +17,7 @@ ui/dist/
 .vite/
 
 # Tauri / Rust
+target/
 ui/src-tauri/target/
 ui/src-tauri/gen/
 
