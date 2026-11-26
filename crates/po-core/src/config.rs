@@ -45,10 +45,6 @@ pub fn thumb_dir() -> PathBuf {
     ensure_dir(app_dir().join("thumbs"))
 }
 
-pub fn log_dir() -> PathBuf {
-    ensure_dir(app_dir().join("logs"))
-}
-
 pub fn settings_path() -> PathBuf {
     app_dir().join("settings.json")
 }

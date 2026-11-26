@@ -122,22 +122,12 @@ pub fn auto_tag(
             pairs.push((r.id, format!("相机:{short}")));
         }
 
-        // 尺寸特征
+        // 只保留有整理意义的尺寸信息：横竖幅和扫描件属于技术特征，
+        // 每张照片都有、又帮不上找照片，不再打成标签
         let w = r.width.unwrap_or(0);
         let h = r.height.unwrap_or(0);
-        if w > 0 && h > 0 {
-            if w < h {
-                pairs.push((r.id, "竖幅".into()));
-            } else if w > h {
-                pairs.push((r.id, "横幅".into()));
-            }
-            if w.max(h) >= 3000 {
-                pairs.push((r.id, "高清大图".into()));
-            }
-            // 扫描件判据：超宽或超高
-            if w.max(h) as f64 >= 2.2 * w.min(h).max(1) as f64 {
-                pairs.push((r.id, "疑似扫描件".into()));
-            }
+        if w > 0 && h > 0 && w.max(h) >= 3000 {
+            pairs.push((r.id, "高清大图".into()));
         }
 
         if let Some(p) = progress {
@@ -266,7 +256,7 @@ pub fn cluster_events(lib: &mut Library, cfg: &Settings) -> EventResult {
             })
             .unwrap();
         let title = event_title(start, end);
-        lib.add_event(
+        let event_id = lib.add_event(
             &title,
             start.as_ref().map(|d| iso_dt(*d)).as_deref(),
             end.as_ref().map(|d| iso_dt(*d)).as_deref(),
@@ -278,18 +268,21 @@ pub fn cluster_events(lib: &mut Library, cfg: &Settings) -> EventResult {
         for i in ev {
             pairs.push((rows[*i].id, format!("事件:{title}")));
         }
+        lib.add_event_members(event_id, &ev.iter().map(|i| rows[*i].id).collect::<Vec<_>>());
         n += 1;
     }
     lib.add_tags_bulk(&pairs, "event", "event");
 
-    // 时间维度标签：年 / 年月 / 年代
+    // 时间维度标签：只打最精确的一层，避免同一张照片堆「年代 / 年 / 年月」三条
     let mut tpairs: Vec<(i64, String)> = Vec::new();
     for r in lib.all_photos("year IS NOT NULL", "id") {
         let y = r.year.unwrap_or(0);
-        let mo = r.month.unwrap_or(1);
-        tpairs.push((r.id, format!("{y}年")));
-        tpairs.push((r.id, format!("{y}年{mo:02}月")));
-        tpairs.push((r.id, format!("{}年代", (y / 10) * 10)));
+        // month 为 0/缺失说明只知道年份，就只打年份
+        let tag = match r.month {
+            Some(m) if (1..=12).contains(&m) => format!("{y}年{m:02}月"),
+            _ => format!("{y}年"),
+        };
+        tpairs.push((r.id, tag));
     }
     lib.add_tags_bulk(&tpairs, "time", "time");
 
@@ -741,7 +734,20 @@ fn split_by_anchor(
         out.push(keep);
     }
     if !rest.is_empty() {
-        out.extend(split_by_anchor(&rest, rows, ph, dh));
+        // 递归必须严格收敛，否则会栈溢出。
+        // 只有「锚点自己也留在 keep 里」时，rest 才一定比 members 短；
+        // 如果锚点被判成不通过（rest 长度 == members 长度），
+        // 继续递归就是用同一份输入再算一次 —— 无限循环。
+        if rest.len() < members.len() {
+            out.extend(split_by_anchor(&rest, rows, ph, dh));
+        } else {
+            // 无法再拆，把剩下的按两两一组强行分开，避免整组被丢弃
+            for chunk in rest.chunks(2) {
+                if chunk.len() > 1 {
+                    out.push(chunk.to_vec());
+                }
+            }
+        }
     }
     if out.is_empty() {
         vec![members.to_vec()]
@@ -902,6 +908,72 @@ mod tests {
     }
 
     #[test]
+    fn split_by_anchor_terminates_when_anchor_rejected() {
+        // 回归测试：锚点自己也被判成"不通过"时，rest 长度等于 members 长度，
+        // 继续递归就是用同一份输入再算一次 —— 无限递归导致栈溢出。
+        // 这里构造一组 pHash 差异极大、且锚点一定过不了的成员。
+        let mut rows = Vec::new();
+        for i in 0..6 {
+            let mut r = crate::library::PhotoRow::default();
+            r.id = i as i64 + 1;
+            r.path = format!("missing_{i}.jpg");
+            rows.push(r);
+        }
+        // 让任意两张的距离都远大于阈值
+        let ph: Vec<u64> = (0..6).map(|i| (i as u64) * 0x1111_1111_1111_1111).collect();
+        let dh: Vec<Option<u64>> = vec![None; 6];
+
+        let members: Vec<usize> = (0..6).collect();
+        // 关键：必须能返回，不能栈溢出
+        let out = split_by_anchor(&members, &rows, &ph, &dh);
+        assert!(!out.is_empty(), "不该返回空");
+        // 每个成员最多出现一次
+        let mut seen = std::collections::HashSet::new();
+        for g in &out {
+            for &m in g {
+                assert!(seen.insert(m), "成员 {m} 重复出现在多个分组");
+            }
+        }
+    }
+
+    #[test]
+    fn split_by_anchor_single_member_returns_as_is() {
+        let rows = vec![crate::library::PhotoRow::default()];
+        let ph = vec![0u64];
+        let dh = vec![None];
+        let out = split_by_anchor(&[0], &rows, &ph, &dh);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], vec![0]);
+    }
+
+    #[test]
+    fn find_duplicates_does_not_overflow_on_unrelated_group() {
+        // 端到端回归：一组差异很大但被并查集连起来的图，
+        // 修好前这里会栈溢出（进程直接崩）
+        let dir = work_dir("po_dup_overflow");
+        for i in 0..4 {
+            std::fs::copy(
+                sample_dir().join("1985-06-12 春节全家福.jpg"),
+                dir.join(format!("p{i}.jpg")),
+            )
+            .unwrap();
+        }
+        let mut lib = Library::open_memory().unwrap();
+        let cfg = Settings::new();
+        crate::scanner::scan_roots(
+            &mut lib,
+            &cfg,
+            Some(&[dir.to_string_lossy().to_string()]),
+            None,
+            None,
+            false,
+        );
+        crate::scanner::analyze_pending(&mut lib, &cfg, 0, None, None, 2, false);
+        // 不应崩溃
+        let _ = find_duplicates(&mut lib, &cfg, None, None);
+    }
+
+    #[test]
     fn duplicates_detected_in_samples() {
         // 用真实样图跑完整去重
         let dir = work_dir("po_dup_samples");
@@ -931,6 +1003,118 @@ mod tests {
             trav[0].dup_group.is_none(),
             "完全不同的照片不该被归为重复"
         );
+    }
+
+    #[test]
+    fn dup_guard_keeps_one_per_group() {
+        let dir = work_dir("po_dup_guard");
+        std::fs::copy(sample_dir().join("DSC_0071.JPG"), dir.join("a.jpg")).unwrap();
+        std::fs::copy(sample_dir().join("重复/完全相同1.jpg"), dir.join("b.jpg")).unwrap();
+        let mut lib = Library::open_memory().unwrap();
+        let cfg = Settings::new();
+        crate::scanner::scan_roots(&mut lib, &cfg, Some(&[dir.to_string_lossy().to_string()]), None, None, false);
+        crate::scanner::analyze_pending(&mut lib, &cfg, 0, None, None, 2, false);
+        find_duplicates(&mut lib, &cfg, None, None);
+
+        let grouped = lib.all_photos("dup_group IS NOT NULL", "id");
+        if grouped.len() < 2 {
+            return; // 样图未形成组时该场景不适用
+        }
+        let gid = grouped[0].dup_group.unwrap();
+        let members: Vec<i64> = lib
+            .all_photos(&format!("dup_group={gid}"), "id")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        // 试图删光整组：必须至少留下 1 张
+        let blocked = lib.blocked_by_dup_guard(&members);
+        assert_eq!(blocked.len(), 1, "整组删除应恰好拦下 1 张：{blocked:?}");
+
+        // 保留 1 张、删其余的合法请求不应被拦
+        let keep = members[0];
+        let rest: Vec<i64> = members.iter().copied().filter(|id| *id != keep).collect();
+        assert!(lib.blocked_by_dup_guard(&rest).is_empty(), "有保留项时不该拦");
+    }
+
+    /// 用户明确确认「整组都删」时，保护应让路。
+    #[test]
+    fn delete_photos_respects_whole_group_opt_in() {
+        let dir = work_dir("po_dup_delete_all");
+        std::fs::copy(sample_dir().join("DSC_0071.JPG"), dir.join("a.jpg")).unwrap();
+        std::fs::copy(sample_dir().join("重复/完全相同1.jpg"), dir.join("b.jpg")).unwrap();
+        let mut lib = Library::open_memory().unwrap();
+        let cfg = Settings::new();
+        crate::scanner::scan_roots(
+            &mut lib,
+            &cfg,
+            Some(&[dir.to_string_lossy().to_string()]),
+            None,
+            None,
+            false,
+        );
+        crate::scanner::analyze_pending(&mut lib, &cfg, 0, None, None, 2, false);
+        find_duplicates(&mut lib, &cfg, None, None);
+
+        let grouped = lib.all_photos("dup_group IS NOT NULL", "id");
+        if grouped.len() < 2 {
+            return;
+        }
+        let members: Vec<i64> = grouped.iter().map(|r| r.id).collect();
+
+        // 1) 默认（不确认）：整组只移走一部分，至少留 1 张在库里
+        let recycle = dir.join("recycle");
+        let s1 = lib.delete_photos_to(&members, &recycle, false, false);
+        assert!(s1.protected >= 1, "默认应保护至少 1 张：{s1:?}");
+        let left = lib.all_photos("missing=0", "id");
+        assert!(!left.is_empty(), "整组不该被删光");
+
+        // 2) 用户明确确认：整组都能移进回收站
+        let mut lib2 = Library::open_memory().unwrap();
+        crate::scanner::scan_roots(
+            &mut lib2,
+            &cfg,
+            Some(&[dir.to_string_lossy().to_string()]),
+            None,
+            None,
+            false,
+        );
+        crate::scanner::analyze_pending(&mut lib2, &cfg, 0, None, None, 2, false);
+        find_duplicates(&mut lib2, &cfg, None, None);
+        let members2: Vec<i64> = lib2
+            .all_photos("dup_group IS NOT NULL", "id")
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        let s2 = lib2.delete_photos_to(&members2, &recycle, false, true);
+        assert_eq!(s2.protected, 0, "明确确认后不该再拦：{s2:?}");
+        assert!(s2.moved >= 2, "两张都应进回收站：{s2:?}");
+    }
+
+    #[test]
+    fn set_dup_keeper_persists_choice() {
+        let mut lib = Library::open_memory().unwrap();
+        let gid = lib.add_dup_group("exact", 2, 0, 10, 10);
+        let a = lib
+            .upsert_photo(&mut PhotoUpdate::new("a.jpg"))
+            .unwrap();
+        let b = lib
+            .upsert_photo(&mut PhotoUpdate::new("b.jpg"))
+            .unwrap();
+        lib.set_dup_members(&[(gid, 1, a), (gid, 0, b)]);
+
+        assert!(lib.set_dup_keeper(gid, b), "应能改到组内另一张");
+        assert_eq!(lib.photo(a).unwrap().is_best, Some(0));
+        assert_eq!(lib.photo(b).unwrap().is_best, Some(1));
+        // 组记录同步更新
+        let groups = lib.dup_groups();
+        let g = groups.iter().find(|x| x.0 == gid).unwrap();
+        assert_eq!(g.3, Some(b));
+
+        // 不在组里的照片不能被设为保留
+        let c = lib
+            .upsert_photo(&mut PhotoUpdate::new("c.jpg"))
+            .unwrap();
+        assert!(!lib.set_dup_keeper(gid, c));
     }
 
     #[test]
@@ -1071,6 +1255,50 @@ mod tests {
     }
 
     #[test]
+    fn cluster_events_records_members_per_event() {
+        let mut lib = Library::open_memory().unwrap();
+        let cfg = Settings::new();
+        // 两段相距很多天的时间；事件标题按年月生成，可能同名，但成员必须严格分开
+        let mut ids = Vec::new();
+        for dt in [
+            "1985-06-12 08:00:00",
+            "1985-06-12 08:30:00",
+            "1985-06-19 20:00:00",
+            "1985-06-19 20:30:00",
+        ] {
+            let mut u = PhotoUpdate::new(&format!("{dt}.jpg"));
+            u.text("dt", Some(dt));
+            ids.push(lib.upsert_photo(&mut u).unwrap());
+        }
+        let r = cluster_events(&mut lib, &cfg);
+        assert_eq!(r.events, 2);
+
+        let events = lib.all_events();
+        assert_eq!(events.len(), 2);
+
+        for (event_id, ..) in &events {
+            let members = lib.photo_ids(&format!(
+                "id IN (SELECT photo_id FROM event_members WHERE event_id={event_id})"
+            ));
+            assert_eq!(members.len(), 2, "每个事件只应包含自己的两张照片");
+        }
+        // 两张照片不能被同一事件同时收进来
+        let mut all = Vec::new();
+        for (event_id, ..) in &events {
+            all.extend(lib.photo_ids(&format!(
+                "id IN (SELECT photo_id FROM event_members WHERE event_id={event_id})"
+            )));
+        }
+        all.sort_unstable();
+        let uniq = {
+            let mut c = all.clone();
+            c.dedup();
+            c
+        };
+        assert_eq!(all.len(), uniq.len(), "同一张照片不应属于两个事件");
+    }
+
+    #[test]
     fn backfill_places_fills_only_empty() {
         let mut lib = Library::open_memory().unwrap();
         let mut u1 = PhotoUpdate::new(r"D:\照片\北京\a.jpg");
@@ -1109,8 +1337,24 @@ mod tests {
         let id = lib.upsert_photo(&mut u).unwrap();
         cluster_events(&mut lib, &cfg);
         let tags = lib.tags_of(id);
-        assert!(tags.contains(&"1992年".to_string()), "{tags:?}");
+        // 只知道月份时打「年月」一层，不再同时堆「年 / 年代」
         assert!(tags.contains(&"1992年10月".to_string()), "{tags:?}");
-        assert!(tags.contains(&"1990年代".to_string()), "{tags:?}");
+        assert!(!tags.contains(&"1992年".to_string()), "不该重复堆年：{tags:?}");
+        assert!(!tags.contains(&"1990年代".to_string()), "不该堆年代：{tags:?}");
+    }
+
+    #[test]
+    fn time_tags_year_only_when_no_month() {
+        let mut lib = Library::open_memory().unwrap();
+        let cfg = Settings::new();
+        let mut u = PhotoUpdate::new("b.jpg");
+        u.text("dt", Some("1985-01-01 00:00:00"))
+            .int("year", Some(1985))
+            .text("dt_precision", Some("year"));
+        let id = lib.upsert_photo(&mut u).unwrap();
+        cluster_events(&mut lib, &cfg);
+        let tags = lib.tags_of(id);
+        assert!(tags.contains(&"1985年".to_string()), "{tags:?}");
+        assert!(!tags.contains(&"1985年01月".to_string()), "精度只到年时不该编造月份：{tags:?}");
     }
 }

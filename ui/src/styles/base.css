@@ -58,13 +58,27 @@ img { display: block; }
 
 /* ---------- 通用组件类 ---------- */
 
+/* 卡片：内高光 + 内阴影 + 淡描边，让它从背景里"隆起"而不是一块平色 */
 .card {
   background: var(--surface);
   border-radius: var(--r-xl);
-  box-shadow: var(--shadow-md);
+  box-shadow: var(--surface-shadow);
+  border: 1px solid var(--surface-stroke);
 }
 
 .card-pad { padding: var(--sp-5); }
+
+/* 可交互卡片：悬停时抬起并加强描边 */
+.card-hover {
+  transition: box-shadow var(--dur) var(--ease),
+              border-color var(--dur) var(--ease),
+              transform var(--dur) var(--ease);
+}
+.card-hover:hover {
+  box-shadow: var(--surface-shadow-hover);
+  border-color: var(--surface-stroke-hover);
+  transform: translateY(-1px);
+}
 
 .icon-btn {
   display: grid;
@@ -77,6 +91,7 @@ img { display: block; }
 }
 .icon-btn:hover { background: var(--surface-hover); color: var(--text-primary); }
 
+/* 筛选胶囊：细描边 + 选中时带光晕，比纯色块精致 */
 .pill {
   display: inline-flex;
   align-items: center;
@@ -85,16 +100,21 @@ img { display: block; }
   padding: 0 14px;
   border-radius: var(--r-pill);
   background: var(--surface-2);
+  border: 1px solid transparent;
   color: var(--text-secondary);
   font-size: var(--fs-sm);
   font-weight: 500;
   white-space: nowrap;
-  transition: all var(--dur) var(--ease);
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease),
+              border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
 }
 .pill:hover { background: var(--surface-3); color: var(--text-primary); }
 .pill.is-active {
-  background: var(--tint-strong);
-  color: var(--brand-400);
+  background: var(--tint);
+  border-color: color-mix(in oklab, var(--brand-400) 42%, transparent);
+  color: var(--brand-300);
+  box-shadow: inset 0 0 0 1px rgba(59,149,247,.10),
+              0 2px 10px rgba(59,149,247,.14);
 }
 
 .btn {
@@ -116,15 +136,20 @@ img { display: block; }
 .btn-primary {
   background: var(--brand-500);
   color: #fff;
-  box-shadow: var(--shadow-glow);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.18), var(--shadow-glow);
 }
 .btn-primary:hover { background: var(--brand-400); }
 
 .btn-ghost {
   background: var(--surface-2);
+  border: 1px solid var(--surface-stroke);
   color: var(--text-secondary);
 }
-.btn-ghost:hover { background: var(--surface-3); color: var(--text-primary); }
+.btn-ghost:hover {
+  background: var(--surface-3);
+  border-color: var(--surface-stroke-hover);
+  color: var(--text-primary);
+}
 
 .ellipsis {
   overflow: hidden;
@@ -135,3 +160,136 @@ img { display: block; }
 /* 渐变卡片上的白色文字统一处理 */
 .on-grad { color: #fff; }
 .on-grad .sub { color: rgba(255,255,255,.78); }
+
+/* ==========================================================================
+   页面级布局基元
+   --------------------------------------------------------------------------
+   以前 9 个页面各写各的根容器、页头、空态，同一个角色最多出现过 4 种写法
+   （gap 10/12/14、padding-bottom 20/24/无、有的还没有 flex）。
+   这里统一收口，各页面只写自己特有的部分。
+   ========================================================================== */
+
+/* 页面根容器：撑满高度、纵向排列、可滚动 */
+.page {
+  height: 100%;
+  min-height: 0;        /* 分栏页面（如修复）靠它才能正确收缩 */
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding-bottom: var(--sp-6);
+}
+
+/* 不分栏、内容自身撑满的页面（如修复页），不要底部留白 */
+.page-flush { padding-bottom: 0; }
+
+/* 页面头部：左侧彩色图标 + 标题副标题，右侧可放操作 */
+.page-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  flex: none;
+  padding: 14px 18px;
+}
+
+.page-head-main { display: flex; align-items: center; gap: var(--sp-3); min-width: 0; }
+
+/* 页头图标块：统一 38×38 */
+.page-head-ico {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  flex: none;
+  border-radius: var(--r-sm);
+  color: #fff;
+}
+
+.page-head-text { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.page-head-text strong {
+  font-size: var(--fs-md); font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.page-head-text span { font-size: var(--fs-xs); color: var(--text-tertiary); }
+
+/* 页头/图标块的渐变底色，全局复用（原来各页自己手写了一遍） */
+.grad-blue   { background: var(--grad-blue); }
+.grad-violet { background: var(--grad-violet); }
+.grad-pink   { background: var(--grad-pink); }
+.grad-green  { background: var(--grad-green); }
+.grad-amber  { background: var(--grad-amber); }
+.grad-accent { background: var(--grad-accent); }
+
+/* 页头右侧动作区 */
+.page-head-acts { display: flex; align-items: center; gap: var(--sp-2); margin-left: auto; flex: none; }
+
+/* ---------- 空状态 ---------- */
+/* 图标 + 标题 + 说明，垂直居中。用 slot 传内容，页面无需再写样式 */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  padding: 72px var(--sp-5);
+  color: var(--text-tertiary);
+  text-align: center;
+}
+.empty-state .es-ico {
+  display: grid;
+  place-items: center;
+  width: 56px;
+  height: 56px;
+  margin-bottom: var(--sp-1);
+  border-radius: var(--r-lg);
+  background: var(--surface-2);
+  color: var(--text-tertiary);
+}
+.empty-state .es-title {
+  font-size: var(--fs-md);
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin: 0;
+}
+.empty-state .es-desc {
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+  color: var(--text-tertiary);
+  margin: 0;
+  max-width: 42ch;
+}
+/* 内容区自己滚动的页面里，空态要能撑满剩余高度 */
+.empty-state.fill { flex: 1; }
+
+/* ---------- 加载状态 ---------- */
+.loading-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  padding: 56px var(--sp-5);
+  font-size: var(--fs-sm);
+  color: var(--text-tertiary);
+}
+.loading-state .ls-spin {
+  width: 15px;
+  height: 15px;
+  flex: none;
+  border-radius: 50%;
+  border: 2px solid var(--line-strong);
+  border-top-color: var(--brand-400);
+  animation: ls-spin 0.7s linear infinite;
+}
+@keyframes ls-spin { to { transform: rotate(360deg); } }
+
+/* ---------- 页面内的分组标题 ---------- */
+.section-title {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+.section-title span { font-weight: 400; color: var(--text-tertiary); font-size: var(--fs-xs); }
+

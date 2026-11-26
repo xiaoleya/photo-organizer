@@ -1,4 +1,4 @@
-﻿//! 老照片修复与增强。
+//! 老照片修复与增强。
 //!
 //! 与 Python 版 `opo/restore.py` 对齐。全部以 f32 平面缓冲实现。
 //!
@@ -8,7 +8,7 @@
 //!      强度压低，且放在去噪之后；
 //!   3) 划痕修补必须只作用于细长结构，否则会把整张图的细节抹平。
 
-use image::{RgbImage, RgbaImage};
+use image::RgbImage;
 
 use crate::imaging::{gray_of, open_image, thumbnail};
 
@@ -171,16 +171,8 @@ pub fn white_patch(img: &RgbImage, pct: f64, strength: f32) -> RgbImage {
 /// 估计并中和色偏（灰世界与白块的折中）。
 pub fn neutral_cast(img: &RgbImage) -> RgbImage {
     let mut ps = to_planes(img);
-    let n = (ps[0].w * ps[0].h).max(1) as f64;
-    for p in ps.iter_mut() {
-        let mean = (p.data.iter().map(|v| *v as f64).sum::<f64>() / n).max(1e-3);
-        let hi = percentile(&p.data, 99.0).max(1e-3);
-        let g1 = 255.0 * 0.0; // 占位，下面按三通道均值重算
-        let _ = g1;
-        let _ = (mean, hi);
-    }
+    let n_all = (ps[0].w * ps[0].h).max(1) as f64;
     // 三通道一起算，才能真正"中和"偏色
-    let n_all = n;
     let mut means = [0f64; 3];
     for (c, p) in ps.iter().enumerate() {
         means[c] = (p.data.iter().map(|v| *v as f64).sum::<f64>() / n_all).max(1e-3);
@@ -221,20 +213,6 @@ pub fn deyellow(img: &RgbImage, strength: f32) -> RgbImage {
         ps[0].data[i] = (ps[0].data[i] - k * 12.0 * (y * 0.5 + 0.5)).clamp(0.0, 255.0);
     }
     from_planes(&ps)
-}
-
-/// 褪色复原：提升饱和度与对比度。
-pub fn restore_color(img: &RgbImage, sat: f32, contrast: f32) -> RgbImage {
-    let out = if (contrast - 1.0).abs() > 0.01 {
-        adjust_contrast(img, contrast)
-    } else {
-        img.clone()
-    };
-    if (sat - 1.0).abs() > 0.01 {
-        adjust_saturation(&out, sat)
-    } else {
-        out
-    }
 }
 
 /// 对比度调整（围绕中灰缩放）：等价于 PIL `ImageEnhance.Contrast`。
@@ -372,20 +350,6 @@ pub fn denoise(img: &RgbImage, strength: u32) -> RgbImage {
         out = gaussian_blur(&out);
     }
     out
-}
-
-/// 按噪点强度选择去噪档位。
-pub fn denoise_adaptive(img: &RgbImage, noise_level: f64) -> RgbImage {
-    if noise_level < 1.8 {
-        return img.clone();
-    }
-    if noise_level < 3.2 {
-        return median_filter(img, 3);
-    }
-    if noise_level < 5.0 {
-        return median_filter(&median_filter(img, 3), 3);
-    }
-    gaussian_blur(&median_filter(img, 5))
 }
 
 // ---------------------------------------------------------------- 细线检测
@@ -729,28 +693,6 @@ pub fn edge_sharpen(img: &RgbImage, amount: f32, radius: f32, threshold: f32) ->
         }
     }
     from_planes(&ps)
-}
-
-/// 按噪点强度做一次温和抑制（放在对比度增强之后，抵消放大）。
-pub fn suppress_noise(img: &RgbImage, level: f64) -> RgbImage {
-    if level < 3.5 {
-        return img.clone();
-    }
-    if level < 6.0 {
-        return median_filter(img, 3);
-    }
-    gaussian_blur(&median_filter(img, 3))
-}
-
-/// 越糊的图锐化越强，但设上限防止白边噪点。
-pub fn smart_sharpen(img: &RgbImage, blur_metric: Option<f64>) -> RgbImage {
-    match blur_metric {
-        None => unsharp(img, 1.4, 110.0, 4.0),
-        Some(b) if b < 40.0 => unsharp(img, 2.2, 200.0, 2.0),
-        Some(b) if b < 90.0 => unsharp(img, 1.9, 165.0, 3.0),
-        Some(b) if b < 200.0 => unsharp(img, 1.5, 120.0, 4.0),
-        Some(_) => unsharp(img, 1.1, 80.0, 5.0),
-    }
 }
 
 // ---------------------------------------------------------------- 边框裁切
@@ -1360,8 +1302,8 @@ fn denoise_to_budget(
     }
     let mut cur = cur;
     let mut now = now;
-    let mut con = std_of(&cur);
-    let lo = keep_contrast.unwrap_or(con * 0.80);
+    // 保住原始对比度：低于这个值就说明糊过头了
+    let lo = keep_contrast.unwrap_or_else(|| std_of(&cur) * 0.80);
 
     for it in 0..max_iter {
         if now <= budget {
@@ -1390,7 +1332,6 @@ fn denoise_to_budget(
         if t_noise > budget * 1.5 {
             cur = trial;
             now = t_noise;
-            con = t_con;
             continue;
         }
         if t_con < lo && t_noise > budget {
@@ -1398,9 +1339,7 @@ fn denoise_to_budget(
         }
         cur = trial;
         now = t_noise;
-        con = t_con;
     }
-    let _ = con;
     cur
 }
 
@@ -1560,19 +1499,6 @@ pub fn save_jpeg(img: &RgbImage, out_path: &std::path::Path, quality: u8) -> boo
         return false;
     }
     std::fs::write(out_path, buf).is_ok()
-}
-
-/// RGBA 图转 RGB（白底），供预览使用。
-pub fn flatten_rgba(rgba: &RgbaImage) -> RgbImage {
-    let (w, h) = rgba.dimensions();
-    let mut out = RgbImage::new(w, h);
-    for (x, y, px) in rgba.enumerate_pixels() {
-        let [r, g, b, a] = px.0;
-        let a = a as u32;
-        let f = |c: u8| (((c as u32) * a + 255 * (255 - a)) / 255).min(255) as u8;
-        out.put_pixel(x, y, image::Rgb([f(r), f(g), f(b)]));
-    }
-    out
 }
 
 #[cfg(test)]

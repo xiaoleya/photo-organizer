@@ -40,36 +40,43 @@ export const api = {
   stats: () => invoke('get_stats'),
   photos: (q = {}) => invoke('get_photos', { query: normalizeQuery(q) }),
   photo: (id) => invoke('get_photo', { id: Number(id) }),
-  tags: () => invoke('get_tags'),
   timeline: () => invoke('get_timeline'),
   places: () => invoke('get_places'),
-  events: () => invoke('get_events'),
   duplicates: () => invoke('get_duplicates'),
   roots: () => invoke('get_roots'),
   settings: () => invoke('get_settings'),
   presets: () => invoke('get_restore_presets'),
   progress: () => invoke('get_scan_progress'),
-  startupState: () => invoke('get_startup_state'),
+  editPhoto: (id, fields = {}) =>
+    invoke('edit_photo', { req: { id: Number(id), ...fields } }),
+  setPhotoTags: (id, tags) =>
+    invoke('set_photo_tags', { id: Number(id), tags: (tags || []).map(String) }),
 
   /* ---- 写操作 ---- */
   saveSettings: (settings) => invoke('save_settings', { settings }),
   addRoot: (path) => invoke('add_root', { path }),
   removeRoot: (path) => invoke('remove_root', { path }),
-  scan: (roots) => invoke('scan_sync', { req: { roots: roots || null } }),
-  scanStart: (roots) => invoke('scan_start', { req: { roots: roots || null } }),
+  scanStart: (roots, reanalyzeAll = false) =>
+    invoke('scan_start', { req: { roots: roots || null, reanalyze_all: reanalyzeAll } }),
+  scanCancel: () => invoke('scan_cancel'),
   favorite: (id, favorite) => invoke('set_favorite', { req: { id: Number(id), favorite } }),
+  /* 批量收藏：一次调用搞定，不用前端循环 */
+  favoriteMany: (ids, favorite = true) =>
+    invoke('set_favorite', { req: { ids: (ids || []).map(Number), favorite } }),
+  /* 批量导出到指定目录 */
+  exportPhotos: (ids, dest, mode = 'copy') =>
+    invoke('export_photos', { req: { ids: (ids || []).map(Number), dest, mode } }),
   reclassify: () => invoke('reclassify'),
   backfillPlaces: (redo = true) => invoke('backfill_places', { redo }),
   resetIndex: (keepRoots = true) => invoke('reset_index', { keepRoots }),
 
   /* ---- 重复清理 ---- */
-  cleanDuplicates: (opts) => invoke('clean_duplicates', { req: opts || {} }),
+  setDupKeeper: (groupId, photoId) =>
+    invoke('set_dup_keeper', { groupId: Number(groupId), photoId: Number(photoId) }),
   deletePhotos: (ids, opts) =>
     invoke('delete_photos', { req: { ids: (ids || []).map(Number), ...(opts || {}) } }),
 
   /* ---- 修复 ---- */
-  restore: (id, preset, options) =>
-    invoke('restore_one', { req: { id: Number(id), preset, options } }),
   restoreApply: (id, preset, options) =>
     invoke('restore_apply', { req: { id: Number(id), preset, options } }),
   restoreBatch: (ids, dest, preset, options) =>
@@ -79,6 +86,15 @@ export const api = {
 
   /* ---- 整理 ---- */
   organize: (opts) => invoke('organize', { req: opts || {} }),
+
+  /* ---- 回收站 ---- */
+  recycle: () => invoke('get_recycle'),
+  // 注意：这里的字段名必须与 Rust 侧 RecycleAction 完全一致（snake_case），
+  // Tauri 不会自动把 logIds 映射成 log_ids —— 写成 camelCase 会导致取不到 id。
+  restoreRecycle: (logIds, all = false) =>
+    invoke('restore_recycle', { req: { log_ids: (logIds || []).map(Number), all } }),
+  purgeRecycle: (logIds, all = false) =>
+    invoke('purge_recycle', { req: { log_ids: (logIds || []).map(Number), all } }),
 }
 
 /* 把 URL 查询风格的键值（全是字符串）转成命令层期望的类型。
@@ -92,6 +108,10 @@ const NUMERIC_KEYS = {
   offset: 'i64',
   min_quality: 'f64',
   max_quality: 'f64',
+  event_id: 'i64',
+  year_from: 'i64',
+  year_to: 'i64',
+  album_id: 'i64',
 }
 
 function normalizeQuery(q) {
@@ -131,6 +151,11 @@ export const native = {
     }
     return r
   },
+  /* 在资源管理器里定位并选中文件 */
+  async reveal(p) {
+    if (!p) return null
+    return await invoke('reveal_in_explorer', { path: p })
+  },
 }
 
 /* ---- 等待后端就绪 ----
@@ -150,16 +175,4 @@ export async function waitForBackend(timeoutMs = 25000, onTick) {
     await new Promise(res => setTimeout(res, 250))
   }
   return false
-}
-
-/* ---- 后端状态单例：全局共享，避免每个视图各等一遍 ---- */
-let _backendReady = null
-export function backendReady() {
-  if (!_backendReady) {
-    _backendReady = waitForBackend()
-  }
-  return _backendReady
-}
-export function resetBackendReady() {
-  _backendReady = null
 }

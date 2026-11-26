@@ -1,4 +1,4 @@
-﻿//! 图像度量：缩略图、质量评分、感知哈希、老照片特征检测。
+//! 图像度量：缩略图、质量评分、感知哈希、老照片特征检测。
 //!
 //! 与 Python 版 `opo/imaging.py` 对齐。所有函数对损坏文件返回 `None`，不 panic。
 //!
@@ -17,7 +17,6 @@ use fast_image_resize::images::Image as FirImage;
 use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
 use image::{DynamicImage, GrayImage, RgbImage, RgbaImage};
 
-pub const THUMB_MAX: u32 = 320;
 /// Pillow 默认的图片像素上限，超了会拒绝解码
 pub const MAX_PIXELS: u64 = 400_000_000;
 
@@ -89,11 +88,6 @@ fn flatten_rgba_on_white(rgba: &RgbaImage) -> RgbImage {
 
 // ---------------------------------------------------------------- 缩放
 
-/// 诊断用：暴露 thumbnail
-pub fn thumbnail_for_diag(img: &RgbImage, max_side: u32) -> RgbImage {
-    thumbnail(img, max_side)
-}
-
 /// 等价于 Pillow 的 `Image.thumbnail((max, max), LANCZOS)`。
 ///
 /// Pillow 的 `thumbnail()` 默认 `reducing_gap=2.0`，内部调用
@@ -140,11 +134,6 @@ pub fn thumbnail(img: &RgbImage, max_side: u32) -> RgbImage {
         return mid;
     }
     resize_lanczos(&mid, dw, dh)
-}
-
-/// 诊断用：暴露 box 降采样
-pub fn box_reduce_pub(img: &RgbImage, dw: u32, dh: u32) -> RgbImage {
-    box_reduce(img, dw, dh)
 }
 
 /// 整数倍 box 均值降采样（先横后纵，与 Pillow `reduce` 一致）。
@@ -859,6 +848,7 @@ pub fn analyze_photo(
         } else {
             None
         },
+        duration: None,
     })
 }
 
@@ -879,6 +869,8 @@ pub struct Analysis {
     pub thumb_ok: bool,
     /// 缩略图落盘路径（仅在 `thumb_ok` 为真时有值）
     pub thumb_path: Option<String>,
+    /// 视频时长（秒）。照片恒为 `None`。
+    pub duration: Option<f64>,
 }
 
 fn median(v: &[f32]) -> f32 {

@@ -64,30 +64,37 @@ const queryFor = (extra) => {
 </script>
 
 <template>
-  <div class="wrap">
-    <div class="head">
-      <span class="summary">
-        <template v-if="years.length">
-          {{ years.length }} 年 · {{ years.reduce((s, y) => s + y.count, 0) }} 张有日期的照片
-        </template>
-        <template v-else-if="loading">正在读取时间轴…</template>
-        <template v-else-if="failed">读取失败，点右侧重试</template>
-        <template v-else>还没有带日期的照片</template>
-      </span>
-      <button class="toggle" :class="{ on: showMonths }" @click="toggleMonths">
-        <span class="dot"></span>{{ showMonths ? '隐藏月份' : '显示月份' }}
-      </button>
-      <button class="toggle" :class="{ on: true }" @click="toggleOrder" :title="monthOrder === 'desc' ? '当前：最近的月份在前' : '当前：最早的月份在前'">
-        <Icon name="sortDown" :size="14" />
-        {{ monthOrder === 'desc' ? '月份 12 → 1' : '月份 1 → 12' }}
-      </button>
-      <button class="toggle" @click="load">刷新</button>
+  <div class="page">
+    <div class="page-head card">
+      <div class="page-head-main">
+        <div class="page-head-ico grad-violet"><Icon name="timeline" :size="20" /></div>
+        <div class="page-head-text">
+          <strong>
+            <template v-if="years.length">{{ years.length }} 年 · {{ years.reduce((s, y) => s + y.count, 0) }} 张</template>
+            <template v-else-if="loading">正在读取时间轴…</template>
+            <template v-else-if="failed">读取失败</template>
+            <template v-else>还没有带日期的照片</template>
+          </strong>
+          <span>按拍摄年份浏览，默认按月展开</span>
+        </div>
+      </div>
+      <div class="page-head-acts">
+        <button class="pill" :class="{ 'is-active': showMonths }" @click="toggleMonths">
+          <span class="dot"></span>{{ showMonths ? '隐藏月份' : '显示月份' }}
+        </button>
+        <button class="pill" :class="{ 'is-active': true }" @click="toggleOrder"
+                :title="monthOrder === 'desc' ? '当前：最近的月份在前' : '当前：最早的月份在前'">
+          <Icon name="sortDown" :size="14" />
+          {{ monthOrder === 'desc' ? '12 → 1' : '1 → 12' }}
+        </button>
+        <button class="btn btn-ghost" @click="load">刷新</button>
+      </div>
     </div>
 
-    <div v-if="!years.length && !loading" class="empty">
-      <Icon name="clock" :size="30" />
-      <h3>{{ failed ? '时间轴读取失败' : '还没有带日期的照片' }}</h3>
-      <p>{{ failed ? '点上方「刷新」重试，或先运行一次「开始识别」' : '运行一次识别后，照片会按年份排成时间轴' }}</p>
+    <div v-if="!years.length && !loading" class="empty-state fill">
+      <div class="es-ico"><Icon name="clock" :size="26" /></div>
+      <h3 class="es-title">{{ failed ? '时间轴读取失败' : '还没有带日期的照片' }}</h3>
+      <p class="es-desc">{{ failed ? '点上方「刷新」重试，或先运行一次「开始扫描」' : '运行一次扫描后，照片会按年份排成时间轴' }}</p>
     </div>
 
     <div v-else class="timeline">
@@ -131,27 +138,9 @@ const queryFor = (extra) => {
 </template>
 
 <style scoped>
-.wrap { height: 100%; overflow-y: auto; padding-bottom: 24px; }
-.head {
-  display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
-  margin-bottom: 12px; font-size: var(--fs-sm); color: var(--text-tertiary);
-}
-.summary { flex: 1; min-width: 160px; }
-.toggle {
-  display: inline-flex; align-items: center; gap: 7px;
-  padding: 7px 14px; border-radius: var(--r-pill);
-  background: var(--surface); box-shadow: var(--shadow-sm);
-  font-size: var(--fs-sm); color: var(--text-secondary);
-}
-.toggle:hover { background: var(--surface-3); color: var(--text-primary); }
-.toggle.on { background: var(--tint-strong); color: var(--brand-300); }
-.toggle .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; opacity: .7; }
-.empty {
-  display: flex; flex-direction: column; align-items: center;
-  justify-content: center; padding: 80px 0; gap: 10px; color: var(--text-tertiary);
-}
-.empty h3 { margin: 0; color: var(--text-secondary); }
-.empty p { margin: 0; font-size: var(--fs-sm); }
+/* 根容器/页头/空态/按钮已统一到 base.css，这里只保留时间轴本身的样式 */
+.page-head-acts .pill { height: 34px; }
+.pill .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; opacity: .7; }
 .timeline { display: flex; flex-direction: column; gap: 12px; }
 .year { background: var(--surface); border-radius: var(--r-xl); box-shadow: var(--shadow-md); overflow: hidden; }
 .year-head { display: flex; width: 100%; align-items: center; gap: 14px; padding: 15px 20px; text-align: left; }

@@ -36,13 +36,27 @@ const LAB_ITEMS = [
 onMounted(async () => {
   ready.value = await waitForBackend(30000)
   if (!ready.value) {
-    setMsg('处理引擎未响应。确认 backend 文件夹与主程序在同一目录', 'err')
+    setMsg('处理引擎未响应，请稍后再试', 'err')
     return
   }
   await loadAll()
   window.addEventListener('opo:index-reset', loadStats)
   window.addEventListener('opo:roots-changed', loadRoots)
+  // 扫描由 App.vue 统一跑，这里只跟随它的开始/结束切换按钮状态
+  window.addEventListener('opo:scan-started', onScanStarted)
+  window.addEventListener('opo:scan-done', onScanDone)
 })
+
+function onScanStarted() {
+  busy.value = true
+  setMsg('正在扫描，请稍候…')
+}
+
+async function onScanDone() {
+  busy.value = false
+  await loadStats()
+  setMsg('扫描完成：共 ' + (stats.value?.total || 0) + ' 张照片', 'ok')
+}
 
 async function loadAll() {
   await Promise.all([loadRoots(), loadStats(), loadSettings()])
@@ -135,30 +149,17 @@ async function resetIndex(alsoRoots) {
   }
 }
 
-/* ---------------- 开始扫描 ---------------- */
+/* ---------------- 开始扫描 ----------------
+ * 进度弹窗由 App.vue 统一提供（和顶部「开始扫描」是同一个），
+ * 这里只负责把请求发出去，避免两处 UI 不一致。 */
 async function runScan() {
   if (!roots.value.length) { setMsg('请先添加照片目录', 'warn'); return }
   busy.value = true
   setMsg('正在扫描，请稍候…')
-  const r = await api.scanStart(roots.value)
-  if (!r || !r.ok) {
-    busy.value = false
-    setMsg('启动失败：' + (r?.error || '后端无响应'), 'err')
-    return
-  }
-  const timer = setInterval(async () => {
-    const p = await api.progress()
-    if (!p) return
-    setMsg(`${p.phase} ${p.total ? p.done + '/' + p.total : ''} · ${p.detail}`, 'info')
-    if (!p.running) {
-      clearInterval(timer)
-      busy.value = false
-      await loadStats()
-      if (p.error) setMsg('扫描失败：' + p.error, 'err')
-      else setMsg('扫描完成：共 ' + (stats.value?.total || 0) + ' 张照片', 'ok')
-      window.dispatchEvent(new CustomEvent('opo:scan-done'))
-    }
-  }, 700)
+  // 交给 App.vue 处理：它会开弹窗、轮询进度、完成后提示
+  window.dispatchEvent(new CustomEvent('opo:scan-request', {
+    detail: { roots: roots.value.slice() },
+  }))
 }
 
 function fmt(n) {
@@ -170,7 +171,16 @@ function fmt(n) {
 </script>
 
 <template>
-  <div class="wrap">
+  <div class="page">
+    <div class="page-head card">
+      <div class="page-head-main">
+        <div class="page-head-ico grad-blue"><Icon name="settings" :size="20" /></div>
+        <div class="page-head-text">
+          <strong>设置</strong>
+          <span>照片目录、扫描记录、外观主题与实验室功能</span>
+        </div>
+      </div>
+    </div>
     <section v-if="stats" class="card block summary">
       <div class="sum-item"><span>照片总数</span><strong>{{ stats.total }}</strong></div>
       <div class="sum-item"><span>已扫描</span><strong>{{ stats.analyzed }}</strong></div>
@@ -212,6 +222,8 @@ function fmt(n) {
         </button>
       </div>
 
+      <!-- 扫描进度弹窗由 App.vue 统一提供，这里不再重复 -->
+
       <div class="divider-line"></div>
 
       <div class="sub-head">
@@ -244,18 +256,29 @@ function fmt(n) {
         <strong>深浅模式</strong>
         <span>切换整体明暗</span>
       </div>
-      <div class="theme-list">
+      <!-- 主题卡：缩略图直接模拟界面结构，比色块直观 -->
+      <div class="theme-grid">
         <button
           v-for="t in THEMES" :key="t.id"
-          class="theme-card" :class="{ on: theme === t.id }"
+          class="theme-card" :class="['theme-' + t.id, { on: theme === t.id }]"
           @click="setTheme(t.id)"
         >
-          <span class="theme-preview" :class="'preview-' + t.id">
-            <span class="pv-bar"></span>
-            <span class="pv-body"><i></i><i></i><i></i></span>
+          <span class="theme-shot">
+            <span class="ts-rail"></span>
+            <span class="ts-side"></span>
+            <span class="ts-main">
+              <i class="ts-card"></i>
+              <i class="ts-card"></i>
+              <i class="ts-card"></i>
+            </span>
           </span>
-          <span class="theme-name">{{ t.label }}</span>
-          <Icon v-if="theme === t.id" name="check" :size="15" />
+          <span class="theme-foot">
+            <Icon :name="t.icon" :size="14" />
+            <span class="theme-name">{{ t.label }}</span>
+            <span v-if="theme === t.id" class="theme-check">
+              <Icon name="check" :size="11" />
+            </span>
+          </span>
         </button>
       </div>
 
@@ -263,15 +286,19 @@ function fmt(n) {
         <strong>强调色</strong>
         <span>影响按钮、选中项与高亮</span>
       </div>
-      <div class="accent-list">
+      <!-- 强调色：大色块 + 渐变，选中有描边和对勾 -->
+      <div class="accent-row">
         <button
           v-for="a in ACCENTS" :key="a.id"
           class="accent-item" :class="{ on: accent === a.id }"
+          :title="a.label"
+          :style="{ '--swatch': a.colors[500], '--swatch-2': a.colors[400] }"
           @click="setAccent(a.id)"
         >
-          <span class="accent-dot" :style="{ background: a.colors[500] }"></span>
-          <span>{{ a.label }}</span>
-          <Icon v-if="accent === a.id" name="check" :size="14" />
+          <span class="accent-swatch">
+            <Icon v-if="accent === a.id" name="check" :size="15" />
+          </span>
+          <span class="accent-name">{{ a.label }}</span>
         </button>
       </div>
     </section>
@@ -316,7 +343,7 @@ function fmt(n) {
 </template>
 
 <style scoped>
-.wrap { height: 100%; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; padding-bottom: 24px; }
+/* 根容器已统一到 base.css 的 .page */
 .block { padding: 18px 22px; }
 .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 14px; }
 .sum-item { display: flex; flex-direction: column; gap: 3px; }
@@ -356,43 +383,99 @@ function fmt(n) {
 .btn-danger:hover { background: rgba(239,68,68,.22); }
 .btn-danger:disabled { opacity: .6; }
 
-/* 外观主题 */
+/* ==========================================================================
+   外观主题
+   --------------------------------------------------------------------------
+   原来是「小色块 + 文字」的小卡片，看不出主题长什么样。
+   改成缩略图式预览：直接画出侧栏 + 内容区 + 卡片的界面结构，
+   选中的那张加描边和对勾，一眼能分辨深浅。
+   ========================================================================== */
 .grad-accent { background: var(--grad-accent); }
-.theme-list { display: flex; gap: 10px; margin-bottom: 15px; }
-.theme-card {
-  display: flex; align-items: center; gap: 10px;
-  min-width: 130px; padding: 10px 12px;
-  border-radius: var(--r-md); background: var(--surface-2);
-  font-size: var(--fs-sm); color: var(--text-secondary);
-  transition: box-shadow var(--dur) var(--ease), background var(--dur) var(--ease);
-}
-.theme-card:hover { background: var(--surface-3); }
-.theme-card.on { box-shadow: inset 0 0 0 2px var(--brand-500); color: var(--brand-300); }
-.theme-preview {
-  position: relative; display: flex; flex-direction: column; gap: 3px;
-  width: 34px; height: 26px; padding: 3px; border-radius: 5px; flex: none;
-  border: 1px solid var(--line);
-}
-.preview-dark { background: #0f1115; }
-.preview-light { background: #f4f6fa; }
-.preview-dark .pv-bar, .preview-dark .pv-body i { background: #3b95f7; }
-.preview-light .pv-bar, .preview-light .pv-body i { background: #3b95f7; }
-.theme-preview .pv-bar { height: 4px; border-radius: 3px; }
-.theme-preview .pv-body { display: flex; flex-direction: column; gap: 2px; }
-.theme-preview .pv-body i { height: 3px; border-radius: 2px; opacity: .65; }
-.theme-preview .pv-body i:nth-child(2) { width: 70%; }
-.theme-preview .pv-body i:nth-child(3) { width: 45%; }
 
-.accent-list { display: flex; flex-wrap: wrap; gap: 9px; }
-.accent-item {
-  display: flex; align-items: center; gap: 7px;
-  padding: 7px 12px; border-radius: var(--r-pill);
-  background: var(--surface-2); font-size: var(--fs-sm);
-  color: var(--text-secondary);
+.theme-grid { display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
+.theme-card {
+  display: flex; flex-direction: column; gap: 0;
+  width: 156px; padding: 0; overflow: hidden;
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  border: 1.5px solid transparent;
+  transition: border-color var(--dur) var(--ease),
+              transform var(--dur) var(--ease),
+              box-shadow var(--dur) var(--ease);
 }
-.accent-item:hover { background: var(--surface-3); }
-.accent-item.on { box-shadow: inset 0 0 0 1.5px var(--brand-500); color: var(--brand-300); }
-.accent-dot { width: 14px; height: 14px; border-radius: 50%; flex: none; }
+.theme-card:hover { transform: translateY(-2px); box-shadow: var(--shadow-md); }
+.theme-card.on {
+  border-color: var(--brand-500);
+  box-shadow: 0 0 0 3px var(--tint), var(--shadow-md);
+}
+
+/* 缩略图：模拟真实界面结构 */
+.theme-shot {
+  position: relative; display: flex;
+  height: 84px; overflow: hidden;
+}
+.ts-rail { width: 13px; flex: none; }
+.ts-side { width: 26px; flex: none; }
+.ts-main { flex: 1; padding: 7px 8px; display: flex; flex-direction: column; gap: 5px; }
+.ts-card { display: block; height: 13px; border-radius: 4px; }
+
+/* 深色预览配色 */
+.theme-dark { background: #0f1115; }
+.theme-dark .theme-shot { background: #0f1115; }
+.theme-dark .ts-rail { background: #191c22; }
+.theme-dark .ts-side { background: #15181d; }
+.theme-dark .ts-card { background: #232832; }
+.theme-dark .ts-card:first-child { background: #2c3441; }
+
+/* 浅色预览配色 */
+.theme-light { background: #ffffff; }
+.theme-light .theme-shot { background: #f4f6fa; }
+.theme-light .ts-rail { background: #ffffff; }
+.theme-light .ts-side { background: #eef2f8; }
+.theme-light .ts-card { background: #ffffff; box-shadow: 0 1px 2px rgba(16,24,40,.08); }
+
+.theme-card.on.theme-dark { background: #0f1115; }
+.theme-card.on.theme-light { background: #ffffff; }
+
+/* 底部标签条 */
+.theme-foot {
+  display: flex; align-items: center; gap: 6px;
+  padding: 8px 11px;
+  font-size: var(--fs-sm); color: var(--text-secondary);
+  border-top: 1px solid var(--line);
+}
+.theme-card.on .theme-foot { color: var(--brand-300); }
+.theme-name { flex: 1; text-align: left; }
+.theme-check {
+  display: grid; place-items: center;
+  width: 17px; height: 17px; flex: none;
+  border-radius: 50%;
+  background: var(--brand-500); color: #fff;
+}
+
+/* 强调色：大圆色块 + 名称，选中有描边与对勾 */
+.accent-row { display: flex; flex-wrap: wrap; gap: 10px; }
+.accent-item {
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  padding: 6px; border-radius: var(--r-md);
+  border: 1.5px solid transparent;
+  transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+.accent-item:hover { background: var(--surface-2); }
+.accent-item.on { border-color: var(--swatch); background: color-mix(in oklab, var(--swatch) 12%, transparent); }
+
+.accent-swatch {
+  display: grid; place-items: center;
+  width: 44px; height: 44px;
+  border-radius: 50%;
+  color: #fff;
+  background: linear-gradient(145deg, var(--swatch-2), var(--swatch));
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.28),
+              0 3px 10px color-mix(in oklab, var(--swatch) 40%, transparent);
+}
+.accent-swatch svg { filter: drop-shadow(0 1px 1px rgba(0,0,0,.28)); }
+.accent-name { font-size: var(--fs-xs); color: var(--text-tertiary); }
+.accent-item.on .accent-name { color: var(--swatch); font-weight: 600; }
 
 /* 实验室功能 */
 .lab-warning {

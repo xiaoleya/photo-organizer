@@ -67,7 +67,7 @@ async function preview() {
   if (r && !r.error) {
     plan.value = r.plan || []
     total.value = r.total || 0
-    unknownPhotos.value = plan.value.filter(x => x[1].startsWith('未识别地点')).length
+    unknownPhotos.value = plan.value.filter(x => x.path.startsWith('未识别地点')).length
   } else {
     setMsg('预览失败：' + (r?.error || '后端无响应'), 'err')
   }
@@ -105,7 +105,17 @@ function toggleLayer(key) {
 </script>
 
 <template>
-  <div class="wrap">
+  <div class="page">
+    <div class="page-head card">
+      <div class="page-head-main">
+        <div class="page-head-ico grad-green"><Icon name="organize" :size="20" /></div>
+        <div class="page-head-text">
+          <strong>整理归档</strong>
+          <span>按年 / 月 / 地点复制或移动照片到新目录</span>
+        </div>
+      </div>
+    </div>
+
     <section class="card block">
       <header>
         <span class="bico grad-blue"><Icon name="organize" :size="18" /></span>
@@ -207,15 +217,13 @@ function toggleLayer(key) {
 </template>
 
 <style scoped>
-.wrap { height: 100%; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; padding-bottom: 20px; }
+/* 根容器/页头已统一到 base.css，这里保留归档表单的样式 */
 .block { padding: 16px 20px; }
 .block header { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 12px; }
 .ht { display: flex; flex-direction: column; gap: 2px; padding-top: 1px; }
 .ht strong { font-size: var(--fs-md); font-weight: 600; }
 .ht p { margin: 0; font-size: var(--fs-xs); color: var(--text-tertiary); }
 .bico { display: grid; place-items: center; width: 32px; height: 32px; flex: none; border-radius: var(--r-sm); color: #fff; }
-.grad-blue { background: var(--grad-blue) } .grad-violet { background: var(--grad-violet) }
-.grad-green { background: var(--grad-green) }
 .schemes { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px; }
 .scheme {
   display: flex; align-items: center; gap: 9px; padding: 9px 11px;

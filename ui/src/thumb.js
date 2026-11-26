@@ -45,3 +45,15 @@ export function photoUrl(row) {
   if (row.path) return B + '/photo?path=' + encodeURIComponent(row.path) + ver(row)
   return ''
 }
+
+/* 视频播放地址：走 /video 端点，支持 Range 分段 */
+export function videoUrl(row) {
+  if (!row) return ''
+  const B = base()
+  if (row.id) {
+    const v = encodeURIComponent(String(row.mtime || 0) + '_' + String(row.size || 0))
+    return B + '/video?id=' + encodeURIComponent(row.id) + '&v=' + v
+  }
+  if (row.path) return B + '/video?path=' + encodeURIComponent(row.path) + ver(row)
+  return ''
+}

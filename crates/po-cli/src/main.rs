@@ -4,18 +4,26 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use po_core::util::{fmt_seconds, human_size_i, parse_iso};
+use po_core::util::human_size_i;
 use po_core::Library;
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match run(&args) {
-        Ok(code) => ExitCode::from(code),
-        Err(e) => {
-            eprintln!("错误: {e}");
-            ExitCode::FAILURE
-        }
-    }
+    // 视频封面走 Windows 系统缩略图接口（COM），调用链较重；
+    // 主线程默认栈只有 1MB，跑大目录时会溢出。这里给足 16MB。
+    let handle = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            match run(&args) {
+                Ok(code) => ExitCode::from(code),
+                Err(e) => {
+                    eprintln!("错误: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        })
+        .expect("无法创建工作线程");
+    handle.join().unwrap_or(ExitCode::FAILURE)
 }
 
 struct Opts {
@@ -610,10 +618,4 @@ fn flag_usize(args: &[String], name: &str) -> Option<usize> {
         }
     }
     None
-}
-
-#[allow(dead_code)]
-fn unused_imports_guard() {
-    let _ = fmt_seconds(1.0);
-    let _ = parse_iso("2020-01-01");
 }

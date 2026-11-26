@@ -57,6 +57,7 @@ pub struct ProgressSnapshot {
     pub elapsed: f64,
     pub elapsed_h: String,
     pub error: String,
+    pub cancelled: bool,
 }
 
 /// 进度汇聚器：内部状态 + 可选的外部回调。
@@ -74,6 +75,7 @@ struct ProgressInner {
     detail: String,
     percent: f64,
     error: String,
+    cancelled: bool,
     started: f64,
     finished: f64,
 }
@@ -95,6 +97,7 @@ impl Progress {
                 detail: String::new(),
                 percent: 0.0,
                 error: String::new(),
+                cancelled: false,
                 started: 0.0,
                 finished: 0.0,
             })),
@@ -120,6 +123,7 @@ impl Progress {
             g.detail = String::new();
             g.percent = 0.0;
             g.error = String::new();
+            g.cancelled = false;
             g.started = crate::library::now_ts();
             g.finished = 0.0;
         }
@@ -141,11 +145,20 @@ impl Progress {
     }
 
     pub fn finish(&self, error: &str) {
+        self.finish_with_status(error, false);
+    }
+
+    pub fn cancel(&self) {
+        self.finish_with_status("", true);
+    }
+
+    fn finish_with_status(&self, error: &str, cancelled: bool) {
         if let Ok(mut g) = self.inner.lock() {
             g.running = false;
             g.error = error.to_string();
+            g.cancelled = cancelled;
             g.finished = crate::library::now_ts();
-            if error.is_empty() {
+            if error.is_empty() && !cancelled {
                 g.percent = 100.0;
             }
         }
@@ -169,6 +182,7 @@ impl Progress {
             elapsed,
             elapsed_h: fmt_seconds(elapsed),
             error: g.error.clone(),
+            cancelled: g.cancelled,
         }
     }
 
@@ -215,6 +229,7 @@ pub struct RunReport {
     pub stats: Option<crate::library::Stats>,
     pub elapsed: f64,
     pub error: String,
+    pub cancelled: bool,
 }
 
 /// 跑完整流程。
@@ -230,7 +245,14 @@ pub fn run_full(
     let t0 = crate::library::now_ts();
     let mut report = RunReport::default();
 
+    let cancelled = |cancel: Option<&CancelFlag>| {
+        cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false)
+    };
     let result = (|| -> Result<(), String> {
+        if cancelled(cancel) {
+            report.cancelled = true;
+            return Ok(());
+        }
         if opts.do_scan {
             let roots_owned: Vec<String> = match roots {
                 Some(r) => r.to_vec(),
@@ -263,6 +285,10 @@ pub fn run_full(
             );
             report.scan = Some(r);
         }
+        if cancelled(cancel) {
+            report.cancelled = true;
+            return Ok(());
+        }
 
         if opts.do_analyze {
             let cb = ProgressFn::from(Arc::new({
@@ -281,6 +307,10 @@ pub fn run_full(
                 opts.redo || opts.reanalyze_all,
             );
             report.analyze = Some(r);
+        }
+        if cancelled(cancel) {
+            report.cancelled = true;
+            return Ok(());
         }
 
         if opts.do_tag {
@@ -303,12 +333,12 @@ pub fn run_full(
             report.place = Some(crate::classify::backfill_places(lib, Some(&cb2), false));
         }
 
-        if opts.do_events {
+        if opts.do_events && !cancelled(cancel) {
             prog.update("聚类事件", 0, 1, "按时间与地点分组…");
             report.events = Some(crate::classify::cluster_events(lib, cfg));
         }
 
-        if opts.do_dup {
+        if opts.do_dup && !cancelled(cancel) {
             prog.update("查找重复", 0, 0, "计算感知哈希相似度…");
             let cb = ProgressFn::from(Arc::new({
                 let p = prog.clone();
@@ -324,6 +354,12 @@ pub fn run_full(
 
     report.elapsed = crate::library::now_ts() - t0;
     match result {
+        Ok(()) if report.cancelled || cancelled(cancel) => {
+            report.cancelled = true;
+            report.stats = Some(lib.stats());
+            prog.update("已取消", 0, 0, "已完成的分析已保留，下次可继续扫描");
+            prog.cancel();
+        }
         Ok(()) => {
             // 记下这次扫描完成的时间，供下次启动时判断"有没有上次的记录"
             let _ = lib.set_meta("last_scan_at", &crate::library::now_ts().to_string());
@@ -554,8 +590,8 @@ mod tests {
             Some(&cancel),
             &RunOptions::default(),
         );
-        // 取消后不应崩溃，且不写入照片
-        assert!(r.error.is_empty());
+        // 取消后不应崩溃，也不把取消当成一次完整扫描
+        assert!(r.cancelled);
         assert_eq!(lib.count(""), 0);
     }
 

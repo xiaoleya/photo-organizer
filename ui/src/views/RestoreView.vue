@@ -166,7 +166,17 @@ const showOpts = computed(() => optionsMeta.value.filter(o => o.key !== 'upscale
 </script>
 
 <template>
-  <div class="wrap">
+  <div class="page page-flush">
+    <div class="page-head card">
+      <div class="page-head-main">
+        <div class="page-head-ico grad-violet"><Icon name="wand" :size="20" /></div>
+        <div class="page-head-text">
+          <strong>照片修复</strong>
+          <span>去泛黄、去划痕、增强清晰度，前后对比可批量处理</span>
+        </div>
+      </div>
+    </div>
+
     <div class="toolbar card">
       <span class="lb">预设</span>
       <select v-model="preset">
@@ -257,7 +267,8 @@ const showOpts = computed(() => optionsMeta.value.filter(o => o.key !== 'upscale
 </template>
 
 <style scoped>
-.wrap { height: 100%; display: flex; flex-direction: column; gap: 10px; min-height: 0; }
+/* 根容器已统一到 base.css 的 .page（修复页是分栏布局，用 page-flush 去掉底部留白） */
+.wrap-inner { min-height: 0; }
 .toolbar { display: flex; align-items: center; gap: 10px; padding: 11px 15px; flex: none; }
 .lb { font-size: var(--fs-sm); color: var(--text-tertiary); }
 select {

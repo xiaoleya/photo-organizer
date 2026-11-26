@@ -75,6 +75,8 @@ pub struct AppState {
     pub path_cache: Arc<Mutex<HashMap<i64, (String, String)>>>,
     /// (path,size) -> 锁。同一张图只让一个线程解码。
     pub decode_locks: Arc<Mutex<HashMap<(String, u32), Arc<Mutex<()>>>>>,
+    /// 只保存取消标志，命令无需等待正在扫描的数据库锁。
+    pub scan_cancel: Arc<Mutex<Option<po_core::scanner::CancelFlag>>>,
 }
 
 impl AppState {
@@ -85,6 +87,7 @@ impl AppState {
             thumb_cache: Arc::new(Mutex::new(ThumbCache::new())),
             path_cache: Arc::new(Mutex::new(HashMap::new())),
             decode_locks: Arc::new(Mutex::new(HashMap::new())),
+            scan_cancel: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -174,6 +177,11 @@ fn photo_json(r: &po_core::library::PhotoRow) -> Value {
     put("is_best", json!(r.is_best.unwrap_or(0)));
     put("note", opt(&r.note));
     put("favorite", json!(r.favorite.unwrap_or(0)));
+    put(
+        "kind",
+        json!(r.kind.clone().unwrap_or_else(|| "photo".into())),
+    );
+    put("duration", opt(&r.duration));
     put("thumb_url", json!(format!("/thumb?id={}", r.id)));
     put("photo_url", json!(format!("/photo?id={}", r.id)));
     Value::Object(m)
@@ -246,11 +254,18 @@ pub fn get_stats(state: State<'_, AppState>) -> Result<Value, String> {
 pub struct PhotoQuery {
     pub flag: Option<String>,
     pub dup: Option<String>,
+    /// `video` / `photo` / 空（全部）
+    pub kind: Option<String>,
     pub nodate: Option<String>,
     pub dup_group: Option<i64>,
     pub fav: Option<String>,
     pub year: Option<i64>,
     pub month: Option<i64>,
+    /// 年份区间（含端点）。单独于精确的 `year`，用于「1985-1990」这类查询
+    pub year_from: Option<i64>,
+    pub year_to: Option<i64>,
+    /// 只看判定为「有人物」的照片
+    pub has_people: Option<String>,
     pub place: Option<String>,
     pub noplace: Option<String>,
     pub min_quality: Option<f64>,
@@ -259,78 +274,142 @@ pub struct PhotoQuery {
     pub sort: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    /// 标签名，走 tags/photo_tags 关联查询
+    pub tag: Option<String>,
 }
 
 fn truthy(s: &Option<String>) -> bool {
     matches!(s.as_deref(), Some("1") | Some("true") | Some("yes"))
 }
 
+/// 把搜索串拆成关键词。
+///
+/// * 按空白（空格 / 全角空格 / 制表符）拆分
+/// * 去掉空串与重复词（避免 `a a` 生成两条相同条件）
+/// * 上限 8 个词：再多的话 SQL 条件会膨胀，而且实际检索意义不大
+fn split_keywords(q: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for w in q.split(|c: char| c.is_whitespace() || c == '\u{3000}') {
+        let w = w.trim();
+        if w.is_empty() {
+            continue;
+        }
+        if out.iter().any(|x| x == w) {
+            continue;
+        }
+        out.push(w.to_string());
+        if out.len() >= 8 {
+            break;
+        }
+    }
+    out
+}
+
+/// 把 PhotoQuery 编译成 (WHERE 子句, 参数)。
+///
+/// 抽出来是为了让「照片列表」「全选全部筛选结果」「智能相册」共用同一套筛选语义，
+/// 避免三处各写一遍导致条件不一致。
+fn build_photo_filter(query: &PhotoQuery) -> (String, Vec<String>) {
+    let mut where_parts: Vec<String> = vec!["missing=0".into()];
+    let mut args: Vec<String> = Vec::new();
+
+    if let Some(f) = query.flag.as_deref().filter(|s| !s.is_empty()) {
+        where_parts.push("flags LIKE ?".into());
+        args.push(format!("%{f}%"));
+    }
+    match query.dup.as_deref() {
+        Some("only") => where_parts.push("dup_group IS NOT NULL".into()),
+        Some("none") => where_parts.push("dup_group IS NULL".into()),
+        _ => {}
+    }
+    match query.kind.as_deref() {
+        Some("video") => where_parts.push("kind='video'".into()),
+        Some("photo") => where_parts.push("(kind IS NULL OR kind='photo')".into()),
+        _ => {}
+    }
+    if truthy(&query.nodate) {
+        where_parts.push("(dt IS NULL OR TRIM(dt)='')".into());
+    }
+    if let Some(g) = query.dup_group {
+        where_parts.push("dup_group = ?".into());
+        args.push(g.to_string());
+    }
+    if truthy(&query.fav) {
+        where_parts.push("favorite=1".into());
+    }
+    if let Some(y) = query.year {
+        where_parts.push("year = ?".into());
+        args.push(y.to_string());
+    }
+    if let Some(y) = query.year_from {
+        where_parts.push("year >= ?".into());
+        args.push(y.to_string());
+    }
+    if let Some(y) = query.year_to {
+        where_parts.push("year <= ?".into());
+        args.push(y.to_string());
+    }
+    if truthy(&query.has_people) {
+        where_parts.push("has_people=1".into());
+    }
+    if let Some(m) = query.month {
+        where_parts.push("month = ?".into());
+        args.push(m.to_string());
+    }
+    if let Some(p) = query.place.as_deref().filter(|s| !s.is_empty()) {
+        where_parts.push("place = ?".into());
+        args.push(p.to_string());
+    }
+    if let Some(tag) = query.tag.as_deref().filter(|s| !s.is_empty()) {
+        where_parts.push(
+            "id IN (SELECT photo_id FROM photo_tags \
+             JOIN tags ON tags.id=photo_tags.tag_id WHERE tags.name=?)"
+                .into(),
+        );
+        args.push(tag.to_string());
+    }
+    if truthy(&query.noplace) {
+        where_parts.push("(place IS NULL OR place='' OR place=?)".into());
+        args.push(geo::UNKNOWN.to_string());
+    }
+    if let Some(v) = query.min_quality {
+        where_parts.push("quality_score >= ?".into());
+        args.push(v.to_string());
+    }
+    if let Some(v) = query.max_quality {
+        where_parts.push("quality_score <= ?".into());
+        args.push(v.to_string());
+    }
+    if let Some(kw) = query.q.as_deref().filter(|s| !s.is_empty()) {
+        for word in split_keywords(kw) {
+            where_parts.push(
+                "(name LIKE ? OR path LIKE ? OR place LIKE ? OR note LIKE ?)".into(),
+            );
+            let pat = format!("%{word}%");
+            args.extend([pat.clone(), pat.clone(), pat.clone(), pat]);
+        }
+    }
+    (where_parts.join(" AND "), args)
+}
+
+fn photo_order(sort: Option<&str>) -> &'static str {
+    match sort {
+        Some("dt DESC") => "dt IS NULL, dt DESC, id DESC",
+        Some("quality_score DESC") => "quality_score DESC, id",
+        Some("quality_score ASC") => "quality_score ASC, id",
+        Some("age_score DESC") => "age_score DESC, id",
+        _ => "dt IS NULL, dt ASC, id",
+    }
+}
+
 #[tauri::command]
 pub fn get_photos(state: State<'_, AppState>, query: PhotoQuery) -> Result<Value, String> {
     state.with_lib(|lib| {
-        let mut where_parts: Vec<String> = vec!["missing=0".into()];
-        let mut args: Vec<String> = Vec::new();
-
-        if let Some(f) = query.flag.as_deref().filter(|s| !s.is_empty()) {
-            where_parts.push("flags LIKE ?".into());
-            args.push(format!("%{f}%"));
-        }
-        match query.dup.as_deref() {
-            Some("only") => where_parts.push("dup_group IS NOT NULL".into()),
-            Some("none") => where_parts.push("dup_group IS NULL".into()),
-            _ => {}
-        }
-        if truthy(&query.nodate) {
-            where_parts.push("(dt IS NULL OR TRIM(dt)='')".into());
-        }
-        if let Some(g) = query.dup_group {
-            where_parts.push("dup_group = ?".into());
-            args.push(g.to_string());
-        }
-        if truthy(&query.fav) {
-            where_parts.push("favorite=1".into());
-        }
-        if let Some(y) = query.year {
-            where_parts.push("year = ?".into());
-            args.push(y.to_string());
-        }
-        if let Some(m) = query.month {
-            where_parts.push("month = ?".into());
-            args.push(m.to_string());
-        }
-        if let Some(p) = query.place.as_deref().filter(|s| !s.is_empty()) {
-            where_parts.push("place = ?".into());
-            args.push(p.to_string());
-        }
-        if truthy(&query.noplace) {
-            where_parts.push("(place IS NULL OR place='' OR place=?)".into());
-            args.push(geo::UNKNOWN.to_string());
-        }
-        if let Some(v) = query.min_quality {
-            where_parts.push("quality_score >= ?".into());
-            args.push(v.to_string());
-        }
-        if let Some(v) = query.max_quality {
-            where_parts.push("quality_score <= ?".into());
-            args.push(v.to_string());
-        }
-        if let Some(kw) = query.q.as_deref().filter(|s| !s.is_empty()) {
-            where_parts.push("(name LIKE ? OR path LIKE ? OR place LIKE ?)".into());
-            let kw = format!("%{kw}%");
-            args.extend([kw.clone(), kw.clone(), kw]);
-        }
-
-        let order = match query.sort.as_deref() {
-            Some("dt DESC") => "dt IS NULL, dt DESC, id DESC",
-            Some("quality_score DESC") => "quality_score DESC, id",
-            Some("quality_score ASC") => "quality_score ASC, id",
-            Some("age_score DESC") => "age_score DESC, id",
-            _ => "dt IS NULL, dt ASC, id",
-        };
+        let (w, args) = build_photo_filter(&query);
+        let order = photo_order(query.sort.as_deref());
 
         let limit = query.limit.unwrap_or(200).clamp(1, 2000);
         let offset = query.offset.unwrap_or(0).max(0);
-        let w = where_parts.join(" AND ");
         let total = lib.count_params(&w, &args);
         let rows = lib.query_photos_paged(&w, order, &args, limit, offset);
         let items: Vec<Value> = rows.iter().map(photo_json).collect();
@@ -354,46 +433,6 @@ pub fn get_photo(state: State<'_, AppState>, id: i64) -> Result<Value, String> {
             v
         }
         None => json!({ "error": "not found" }),
-    })
-}
-
-#[tauri::command]
-pub fn get_tags(state: State<'_, AppState>) -> Result<Value, String> {
-    state.with_lib(|lib| {
-        let items: Vec<Value> = lib
-            .all_tags()
-            .into_iter()
-            .map(|(name, kind, count)| {
-                let group = match kind.as_str() {
-                    "auto" => {
-                        if matches!(
-                            name.as_str(),
-                            "模糊"
-                                | "过暗"
-                                | "过亮"
-                                | "低分辨率"
-                                | "褪色平淡"
-                                | "泛黄/棕褐"
-                                | "噪点重"
-                                | "高光过曝"
-                                | "大面积死黑"
-                                | "灰白/单色"
-                        ) {
-                            "质量"
-                        } else if name.starts_with("相机:") {
-                            "相机"
-                        } else {
-                            "特征"
-                        }
-                    }
-                    "event" => "事件",
-                    "time" => "时间",
-                    _ => "自定义",
-                };
-                json!({ "name": name, "kind": kind, "count": count, "group": group })
-            })
-            .collect();
-        json!({ "items": items })
     })
 }
 
@@ -489,23 +528,6 @@ pub fn get_places(state: State<'_, AppState>) -> Result<Value, String> {
 }
 
 #[tauri::command]
-pub fn get_events(state: State<'_, AppState>) -> Result<Value, String> {
-    state.with_lib(|lib| {
-        let items: Vec<Value> = lib
-            .all_events()
-            .into_iter()
-            .map(|(id, title, start, end, count, cover)| {
-                json!({
-                    "id": id, "title": title, "start_dt": start,
-                    "end_dt": end, "count": count, "cover_id": cover,
-                })
-            })
-            .collect();
-        json!({ "items": items })
-    })
-}
-
-#[tauri::command]
 pub fn get_duplicates(state: State<'_, AppState>) -> Result<Value, String> {
     state.with_lib(|lib| {
         let groups = lib.dup_groups();
@@ -558,39 +580,67 @@ pub fn get_scan_progress(state: State<'_, AppState>) -> Value {
 }
 
 /// 启动时的状态快照：前端据此决定要不要弹「清除上次扫描记录」。
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct EditPhotoRequest {
+    pub id: i64,
+    pub date: Option<String>,
+    pub date_precision: Option<String>,
+    pub place: Option<String>,
+    pub note: Option<String>,
+    pub clear_date: Option<bool>,
+    pub clear_place: Option<bool>,
+    pub clear_note: Option<bool>,
+}
+
 #[tauri::command]
-pub fn get_startup_state(state: State<'_, AppState>) -> Result<Value, String> {
+pub fn edit_photo(state: State<'_, AppState>, req: EditPhotoRequest) -> Result<Value, String> {
     state.with_lib(|lib| {
-        let total = lib.query_count("SELECT COUNT(*) c FROM photos", &[]);
-        let analyzed = lib.query_count(
-            "SELECT COUNT(*) c FROM photos WHERE analyzed_at IS NOT NULL",
-            &[],
-        );
-        let roots = lib.roots().len();
-        // 上次扫描时间：优先用 meta 里记录的，其次取库里最大的 analyzed_at
-        let last_scan = lib
-            .get_meta("last_scan_at")
-            .and_then(|s| s.parse::<f64>().ok())
-            .or_else(|| {
-                let v: f64 = lib
-                    .conn()
-                    .query_row(
-                        "SELECT COALESCE(MAX(analyzed_at),0) FROM photos",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .unwrap_or(0.0);
-                (v > 0.0).then_some(v)
-            })
-            .unwrap_or(0.0);
-        json!({
-            "total": total,
-            "analyzed": analyzed,
-            "roots": roots,
-            "last_scan": last_scan,
-            // 有内容才值得问；空库不问
-            "has_previous": total > 0,
-        })
+        let Some(_) = lib.photo(req.id) else {
+            return json!({ "ok": false, "error": "没有这张照片" });
+        };
+        if req.clear_date.unwrap_or(false) {
+            let _ = lib.set_manual_date(req.id, None, None);
+        } else if req.date.is_some() {
+            let _ = lib.set_manual_date(
+                req.id,
+                req.date.as_deref(),
+                req.date_precision.as_deref(),
+            );
+        }
+        if req.clear_place.unwrap_or(false) {
+            let _ = lib.set_manual_place(req.id, None);
+        } else if req.place.is_some() {
+            let _ = lib.set_manual_place(req.id, req.place.as_deref());
+        }
+        if req.clear_note.unwrap_or(false) {
+            let _ = lib.set_note(req.id, None);
+        } else if req.note.is_some() {
+            let _ = lib.set_note(req.id, req.note.as_deref());
+        }
+        json!({ "ok": true })
+    })
+}
+
+#[tauri::command]
+pub fn set_photo_tags(
+    state: State<'_, AppState>,
+    id: i64,
+    tags: Vec<String>,
+) -> Result<Value, String> {
+    state.with_lib(|lib| {
+        let Some(_) = lib.photo(id) else {
+            return json!({ "ok": false, "error": "没有这张照片" });
+        };
+        // 只管理 user 标签：删除这张照片现有的自定义标签，再按顺序写入
+        let existing = lib.tags_of(id);
+        for name in existing {
+            lib.remove_tag(id, &name);
+        }
+        for name in tags.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            lib.add_tag(id, name, "user", "user");
+        }
+        json!({ "ok": true, "tags": lib.tags_of(id) })
     })
 }
 
@@ -640,14 +690,12 @@ pub fn remove_root(state: State<'_, AppState>, path: String) -> Result<Value, St
 #[serde(default)]
 pub struct ScanRequest {
     pub roots: Option<Vec<String>>,
+    pub reanalyze_all: Option<bool>,
 }
 
 #[tauri::command]
 pub fn scan_start(state: State<'_, AppState>, req: ScanRequest) -> Result<Value, String> {
-    if state.progress.is_running() {
-        return Ok(json!({ "ok": false, "error": "已有扫描任务在进行中" }));
-    }
-    let roots = state.with_lib(|lib| match req.roots.filter(|r| !r.is_empty()) {
+    let roots = state.with_lib(|lib| match req.roots.clone().filter(|r| !r.is_empty()) {
         Some(r) => r,
         None => lib.roots(),
     })?;
@@ -655,62 +703,89 @@ pub fn scan_start(state: State<'_, AppState>, req: ScanRequest) -> Result<Value,
         return Ok(json!({ "ok": false, "error": "还没有添加照片目录" }));
     }
 
-    state.progress.reset();
+    let cancel = pipeline::new_cancel();
+    {
+        let mut current = state.scan_cancel.lock().map_err(|e| e.to_string())?;
+        if state.progress.is_running() {
+            return Ok(json!({ "ok": false, "error": "已有扫描任务在进行中" }));
+        }
+        state.progress.reset();
+        *current = Some(cancel.clone());
+    }
     let st = state.inner().clone();
     std::thread::spawn(move || {
         let cfg = config::load_settings();
         let opts = RunOptions {
-            // 每次「开始扫描」都按当前实验室开关重算
-            reanalyze_all: true,
+            reanalyze_all: req.reanalyze_all.unwrap_or(false),
             ..Default::default()
         };
         let result = st.with_lib(|lib| {
-            pipeline::run_full(lib, &cfg, Some(&roots), &st.progress, None, &opts)
+            pipeline::run_full(
+                lib,
+                &cfg,
+                Some(&roots),
+                &st.progress,
+                Some(&cancel),
+                &opts,
+            )
         });
         match result {
             Ok(r) if r.error.is_empty() => {}
             Ok(r) => st.progress.finish(&r.error),
             Err(e) => st.progress.finish(&e),
         }
+        if let Ok(mut current) = st.scan_cancel.lock() {
+            *current = None;
+        }
     });
     Ok(json!({ "ok": true }))
 }
 
 #[tauri::command]
-pub fn scan_sync(state: State<'_, AppState>, req: ScanRequest) -> Result<Value, String> {
-    state.progress.reset();
-    let prog = state.progress.clone();
-    let out = state.with_lib(|lib| {
-        let cfg = config::load_settings();
-        let r = pipeline::run_full(
-            lib,
-            &cfg,
-            req.roots.as_deref(),
-            &prog,
-            None,
-            &RunOptions::default(),
-        );
-        serde_json::to_value(&r).unwrap_or(json!({}))
-    })?;
-    Ok(out)
+pub fn scan_cancel(state: State<'_, AppState>) -> Result<Value, String> {
+    let current = state.scan_cancel.lock().map_err(|e| e.to_string())?;
+    let Some(cancel) = current.as_ref() else {
+        return Ok(json!({ "ok": false, "error": "当前没有正在进行的扫描" }));
+    };
+    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(json!({ "ok": true }))
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct FavoriteRequest {
-    pub id: i64,
+    /// 单个 id（兼容旧调用）
+    pub id: Option<i64>,
+    /// 批量 id。给了就忽略 `id`
+    pub ids: Option<Vec<i64>>,
     pub favorite: Option<bool>,
 }
 
 #[tauri::command]
 pub fn set_favorite(state: State<'_, AppState>, req: FavoriteRequest) -> Result<Value, String> {
     state.with_lib(|lib| {
-        let Some(row) = lib.photo(req.id) else {
+        // 批量优先
+        if let Some(ids) = req.ids.as_ref().filter(|v| !v.is_empty()) {
+            let mut changed = 0usize;
+            let want = req.favorite.unwrap_or(true);
+            for id in ids {
+                if lib.photo(*id).is_some() {
+                    lib.set_favorite(*id, want);
+                    changed += 1;
+                }
+            }
+            return json!({ "ok": true, "count": changed, "favorite": want });
+        }
+
+        let Some(id) = req.id else {
+            return json!({ "ok": false, "error": "没有指定照片" });
+        };
+        let Some(row) = lib.photo(id) else {
             return json!({ "ok": false, "error": "没有这张照片" });
         };
         let want = req.favorite.unwrap_or(!row.is_favorite());
-        lib.set_favorite(req.id, want);
-        json!({ "ok": true, "id": req.id, "favorite": want })
+        lib.set_favorite(id, want);
+        json!({ "ok": true, "id": id, "favorite": want, "count": 1 })
     })
 }
 
@@ -786,26 +861,45 @@ fn recycle_dir(dest: Option<String>) -> PathBuf {
     }
 }
 
-#[tauri::command]
-pub fn clean_duplicates(
-    state: State<'_, AppState>,
-    req: CleanDupsRequest,
-) -> Result<Value, String> {
-    let keep_all = req.keep_all.unwrap_or(false);
-    let group_ids = req.groups.unwrap_or_default();
-    if !keep_all && group_ids.is_empty() {
-        return Ok(json!({ "ok": false, "error": "未选择要清理的重复组" }));
+/// 视频封面文件缺失时现场重建，并写回库。
+///
+/// 缩略图缓存目录属于「可丢弃的缓存」：用户清理磁盘、
+/// 或者从旧版本升级时，库里的路径可能已经失效。
+/// 这时不能直接返回 404（那样整片视频会一直显示占位图），
+/// 应该重新抽一张帧，顺手把路径修正回库。
+pub fn regenerate_video_cover(
+    state: &AppState,
+    id: Option<i64>,
+    video: &Path,
+) -> Option<String> {
+    // 没有 id 说明是按 path 直接请求的（例如刚导出还没入库），
+    // 生成到临时文件即可，不写库。
+    let out = match id {
+        Some(i) => config::thumb_dir().join(format!("video_{i}.jpg")),
+        None => config::thumb_dir().join(format!(
+            "video_tmp_{}.jpg",
+            po_core::library::now_ts() as i64
+        )),
+    };
+    if !po_core::video::extract_frame(video, &out, 480) {
+        return None;
     }
-    let permanent = req.delete.unwrap_or(false);
-    let recycle = recycle_dir(req.dest.clone());
+    let saved = out.to_string_lossy().to_string();
+    if let Some(i) = id {
+        let _ = state.with_lib(|lib| lib.set_video_thumb(i, &saved));
+    }
+    Some(saved)
+}
+
+#[tauri::command]
+pub fn set_dup_keeper(
+    state: State<'_, AppState>,
+    group_id: i64,
+    photo_id: i64,
+) -> Result<Value, String> {
     state.with_lib(|lib| {
-        let s = lib.clean_duplicate_copies(&group_ids, keep_all, &recycle, permanent);
-        json!({
-            "ok": true,
-            "moved": s.moved, "removed": s.removed, "errors": s.errors,
-            "freed": s.freed, "dest": recycle.to_string_lossy(),
-            "permanent": permanent,
-        })
+        let ok = lib.set_dup_keeper(group_id, photo_id);
+        json!({ "ok": ok })
     })
 }
 
@@ -815,6 +909,8 @@ pub struct DeletePhotosRequest {
     pub ids: Vec<i64>,
     pub dest: Option<String>,
     pub permanent: Option<bool>,
+    /// 用户已确认「整组一起删」，不再保底留一张
+    pub allow_whole_group: Option<bool>,
 }
 
 #[tauri::command]
@@ -828,10 +924,15 @@ pub fn delete_photos(
     let permanent = req.permanent.unwrap_or(false);
     let recycle = recycle_dir(req.dest.clone());
     state.with_lib(|lib| {
-        let s = lib.delete_photos_to(&req.ids, &recycle, permanent);
+        let s = lib.delete_photos_to(
+            &req.ids,
+            &recycle,
+            permanent,
+            req.allow_whole_group.unwrap_or(false),
+        );
         json!({
             "ok": true, "moved": s.moved, "removed": s.removed,
-            "errors": s.errors, "freed": s.freed,
+            "errors": s.errors, "freed": s.freed, "protected": s.protected,
             "dest": recycle.to_string_lossy(),
         })
     })
@@ -863,30 +964,6 @@ fn gain_json(before: &imaging::Metrics, after: &imaging::Metrics) -> Value {
         "contrast": pct(before.contrast, after.contrast),
         "detail": pct(before.blur, after.blur),
         "sepia": ((1.0 - after.sepia.max(0.0) / before.sepia.max(1e-6)) * 1000.0).round() / 10.0,
-    })
-}
-
-#[tauri::command]
-pub fn restore_one(state: State<'_, AppState>, req: RestoreRequest) -> Result<Value, String> {
-    let opts = build_restore_options(req.preset.as_deref(), req.options.as_ref());
-    state.with_lib(|lib| {
-        let Some(row) = lib.photo(req.id) else {
-            return json!({ "error": "没有这张照片" });
-        };
-        let Some(res) = restore::enhance_file(Path::new(&row.path), &opts) else {
-            return json!({ "error": "这张图无法解码" });
-        };
-        let out_path = config::app_dir().join(format!("restored_{}.jpg", req.id));
-        let saved = restore::save_jpeg(&res.image, &out_path, 95);
-        json!({
-            "id": req.id,
-            "path": out_path.to_string_lossy(),
-            "path_url": format!("/photo?path={}", urlencode(&out_path.to_string_lossy())),
-            "before": metrics_json(&res.before),
-            "after": metrics_json(&res.after),
-            "gain": gain_json(&res.before, &res.after),
-            "ok": saved,
-        })
     })
 }
 
@@ -1011,7 +1088,10 @@ pub fn organize(state: State<'_, AppState>, req: OrganizeRequest) -> Result<Valu
             let preview: Vec<Value> = plan
                 .iter()
                 .take(500)
-                .map(|(pid, rel)| json!({ "id": pid, "path": rel }))
+                .map(|(pid, rel)| {
+                    let from = lib.photo(*pid).map(|r| r.path).unwrap_or_default();
+                    json!({ "id": pid, "path": rel, "from": from })
+                })
                 .collect();
             return json!({ "plan": preview, "total": plan.len() });
         }
@@ -1225,12 +1305,259 @@ pub fn resolve_image_path(state: &AppState, id: Option<i64>, path: Option<&str>)
     None
 }
 
-#[allow(dead_code)]
-fn unused(_: &util::Precision) {}
+// ---------------------------------------------------------------- 批量导出
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ExportRequest {
+    pub ids: Vec<i64>,
+    pub dest: Option<String>,
+    /// `copy`（默认）或 `move`
+    pub mode: Option<String>,
+}
+
+/// 把选中的照片/视频按原名导出到指定目录（重名自动加序号，不覆盖）。
+#[tauri::command]
+pub fn export_photos(state: State<'_, AppState>, req: ExportRequest) -> Result<Value, String> {
+    if req.ids.is_empty() {
+        return Ok(json!({ "ok": false, "error": "没有选中照片" }));
+    }
+    let Some(dest) = req.dest.filter(|s| !s.trim().is_empty()) else {
+        return Ok(json!({ "ok": false, "error": "请先选择输出文件夹" }));
+    };
+    let dest = PathBuf::from(dest.trim());
+    if std::fs::create_dir_all(&dest).is_err() {
+        return Ok(json!({ "ok": false, "error": "无法创建输出目录" }));
+    }
+    let move_mode = req.mode.as_deref() == Some("move");
+
+    state.with_lib(|lib| {
+        let (mut done, mut errors) = (0, 0);
+        let mut freed = 0i64;
+        let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for id in &req.ids {
+            let Some(row) = lib.photo(*id) else {
+                errors += 1;
+                continue;
+            };
+            let src = PathBuf::from(&row.path);
+            if !src.is_file() {
+                errors += 1;
+                continue;
+            }
+            // 目标同名时加序号，绝不覆盖已有文件
+            let out = util::unique_path(&dest.join(row.file_name()), &mut used);
+            let ok = if move_mode {
+                std::fs::rename(&src, &out).is_ok()
+                    || (std::fs::copy(&src, &out).is_ok() && std::fs::remove_file(&src).is_ok())
+            } else {
+                std::fs::copy(&src, &out).is_ok()
+            };
+            if ok {
+                done += 1;
+                freed += row.size.unwrap_or(0);
+                if move_mode {
+                    lib.repoint_photo_path(&row.path, &out.to_string_lossy());
+                    lib.mark_missing(*id, false);
+                }
+            } else {
+                errors += 1;
+            }
+        }
+        json!({
+            "ok": true, "done": done, "errors": errors,
+            "freed": freed, "dest": dest.to_string_lossy(),
+        })
+    })
+}
+
+// ---------------------------------------------------------------- 回收站
+
+/// 列出回收站：被移到回收目录、尚未取回的文件。
+#[tauri::command]
+pub fn get_recycle(state: State<'_, AppState>) -> Result<Value, String> {
+    state.with_lib(|lib| {
+        // 顺手清掉「文件早就没了」的幽灵记录，
+        // 免得它们让「全部取回」失败、或让计数对不上
+        let _ = lib.purge_ghost_recycle_entries();
+        let items: Vec<Value> = lib
+            .recycle_entries()
+            .into_iter()
+            .map(|(log_id, src, dst, ts)| {
+                let name = Path::new(&dst)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let size = std::fs::metadata(&dst).map(|m| m.len() as i64).unwrap_or(0);
+                let is_vid = util::is_video(Path::new(&dst));
+                // 视频没有可实时解码的帧，缩略图走库里预生成的封面
+                let thumb = if is_vid {
+                    lib.photo_by_path(&dst).and_then(|r| r.thumb)
+                } else {
+                    None
+                };
+                json!({
+                    "log_id": log_id,
+                    "name": name,
+                    "src": src,
+                    "dst": dst,
+                    "size": size,
+                    "ts": ts,
+                    "kind": if is_vid { "video" } else { "photo" },
+                    "thumb": thumb,
+                })
+            })
+            .collect();
+        let total = items.len();
+        let bytes: i64 = items.iter().map(|v| v["size"].as_i64().unwrap_or(0)).sum();
+        json!({ "items": items, "total": total, "bytes": bytes })
+    })
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct RecycleAction {
+    pub log_ids: Option<Vec<i64>>,
+    /// 为 true 时表示全部
+    pub all: Option<bool>,
+}
+
+fn recycle_ids(lib: &po_core::library::Library, req: &RecycleAction) -> Vec<i64> {
+    if req.all == Some(true) {
+        return lib.recycle_entries().into_iter().map(|e| e.0).collect();
+    }
+    req.log_ids.clone().unwrap_or_default()
+}
+
+/// 从回收站取回（移回原路径并恢复索引）。
+#[tauri::command]
+pub fn restore_recycle(
+    state: State<'_, AppState>,
+    req: RecycleAction,
+) -> Result<Value, String> {
+    let ids = state.with_lib(|lib| recycle_ids(lib, &req))?;
+    if ids.is_empty() {
+        return Ok(json!({ "ok": false, "error": "没有可取回的文件" }));
+    }
+    state.with_lib(|lib| {
+        let (mut done, mut errors) = (0, 0);
+        let mut last_msg = String::new();
+        for id in &ids {
+            let (ok, _path, msg) = lib.restore_from_recycle(*id);
+            if ok {
+                done += 1;
+            } else {
+                errors += 1;
+                if !msg.is_empty() {
+                    last_msg = msg;
+                }
+            }
+        }
+        json!({ "ok": true, "done": done, "errors": errors, "message": last_msg })
+    })
+}
+
+/// 永久删除回收站里的文件（不可恢复）。
+#[tauri::command]
+pub fn purge_recycle(state: State<'_, AppState>, req: RecycleAction) -> Result<Value, String> {
+    let ids = state.with_lib(|lib| recycle_ids(lib, &req))?;
+    if ids.is_empty() {
+        return Ok(json!({ "ok": false, "error": "没有可删除的文件" }));
+    }
+    state.with_lib(|lib| {
+        let (mut done, mut errors) = (0, 0);
+        for id in &ids {
+            let (ok, _) = lib.purge_recycle(*id);
+            if ok {
+                done += 1;
+            } else {
+                errors += 1;
+            }
+        }
+        json!({ "ok": true, "done": done, "errors": errors })
+    })
+}
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod tests {    use super::*;
+
+    /// 「全部取回」传的是空 ids + all=true，
+    /// 必须能正确反序列化成「取全部」，否则按钮点了等于没反应。
+    #[test]
+    fn recycle_action_all_flag_parses() {
+        let v: Value = serde_json::from_str(r#"{"log_ids":[],"all":true}"#).unwrap();
+        let req: RecycleAction = serde_json::from_value(v).unwrap();
+        assert_eq!(req.all, Some(true), "all 标志没被解析出来");
+        assert_eq!(req.log_ids.as_deref(), Some(&[][..]));
+    }
+
+    /// all 缺失（undefined 被序列化成 null）时，不能悄悄退化成「取 0 个」。
+    #[test]
+    fn recycle_action_all_null_means_empty_selection() {
+        let v: Value = serde_json::from_str(r#"{"log_ids":[],"all":null}"#).unwrap();
+        let req: RecycleAction = serde_json::from_value(v).unwrap();
+        assert_eq!(req.all, None);
+        // 这种输入下 recycle_ids 会返回空 —— 所以前端必须保证 all 是明确的布尔值
+        assert!(req.log_ids.as_deref().unwrap_or(&[]).is_empty());
+    }
+
+    /// 端到端：把文件移进回收站，再用 all=true 全部取回。
+    #[test]
+    fn restore_all_roundtrip() {
+        use po_core::library::{Library, PhotoUpdate};
+        let dir = std::env::temp_dir().join("po_cmd_recycle_all");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let recycle = dir.join("recycle");
+        std::fs::create_dir_all(&recycle).unwrap();
+
+        let mut lib = Library::open_memory().unwrap();
+        let mut paths = Vec::new();
+        for i in 0..3 {
+            let p = dir.join(format!("p{i}.jpg"));
+            std::fs::write(&p, b"x").unwrap();
+            let mut u = PhotoUpdate::new(p.to_string_lossy().to_string());
+            u.text("name", Some(&format!("p{i}.jpg")));
+            lib.upsert_photo(&u).unwrap();
+            paths.push(p);
+        }
+        let ids = lib.all_photos("", "id").iter().map(|r| r.id).collect::<Vec<_>>();
+        lib.delete_photos_to(&ids, &recycle, false, false);
+        assert_eq!(lib.recycle_entries().len(), 3);
+        assert!(paths.iter().all(|p| !p.exists()));
+
+        // 模拟 all=true 的取回
+        let req = RecycleAction { log_ids: Some(vec![]), all: Some(true) };
+        let to_restore = recycle_ids(&lib, &req);
+        assert_eq!(to_restore.len(), 3, "all=true 应选中全部 3 个");
+        for id in to_restore {
+            let (ok, _, msg) = lib.restore_from_recycle(id);
+            assert!(ok, "{msg}");
+        }
+        assert!(paths.iter().all(|p| p.exists()), "文件都应回到原位");
+        assert!(lib.recycle_entries().is_empty());
+    }
+
+    #[test]
+    fn recycle_action_partial_selection_parses() {
+        let v: Value = serde_json::from_str(r#"{"log_ids":[3,7],"all":false}"#).unwrap();
+        let req: RecycleAction = serde_json::from_value(v).unwrap();
+        assert_eq!(req.all, Some(false));
+        assert_eq!(req.log_ids, Some(vec![3, 7]));
+    }
+
+    /// 缩略图缓存失效时，视频封面应能现场重建，而不是永远 404。
+    #[test]
+    fn regenerate_cover_returns_none_for_missing_video() {
+        let state = AppState::new();
+        let got = regenerate_video_cover(
+            &state,
+            None,
+            std::path::Path::new("no_such_video_xyz.mp4"),
+        );
+        assert!(got.is_none(), "源文件不存在时不该返回封面路径");
+    }
 
     #[test]
     fn base64_matches_rfc4648() {
@@ -1510,6 +1837,45 @@ mod tests {
         assert!(!truthy(&Some("0".into())));
         assert!(!truthy(&Some("false".into())));
         assert!(!truthy(&None));
+    }
+
+    #[test]
+    fn split_keywords_basic() {
+        assert_eq!(split_keywords("父母 北京"), vec!["父母", "北京"]);
+        assert_eq!(split_keywords("  单个  "), vec!["单个"]);
+        assert_eq!(split_keywords(""), Vec::<String>::new());
+        assert_eq!(split_keywords("   "), Vec::<String>::new());
+    }
+
+    #[test]
+    fn split_keywords_handles_fullwidth_space() {
+        // 中文输入法下常见的全角空格
+        assert_eq!(split_keywords("父母\u{3000}北京"), vec!["父母", "北京"]);
+        // 制表符与换行也算空白
+        assert_eq!(split_keywords("a\tb\nc"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn split_keywords_dedupes() {
+        // 重复词不该生成两条相同条件
+        assert_eq!(split_keywords("北京 北京 上海"), vec!["北京", "上海"]);
+    }
+
+    #[test]
+    fn split_keywords_caps_at_eight() {
+        let long = "1 2 3 4 5 6 7 8 9 10 11 12";
+        let got = split_keywords(long);
+        assert_eq!(got.len(), 8, "最多 8 个词，实际 {}", got.len());
+        assert_eq!(got[0], "1");
+        assert_eq!(got[7], "8");
+    }
+
+    #[test]
+    fn split_keywords_keeps_single_word_intact() {
+        // 单个词内部不拆（如「父母合影」是一个词）
+        assert_eq!(split_keywords("父母合影"), vec!["父母合影"]);
+        // 连字符也不是分隔符
+        assert_eq!(split_keywords("1985-06-12"), vec!["1985-06-12"]);
     }
 
     #[test]

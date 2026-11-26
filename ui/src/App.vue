@@ -1,7 +1,8 @@
 ﻿<script setup>
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import Icon from './components/Icon.vue'
 import TitleBar from './components/TitleBar.vue'
+import ConfirmDialog from './components/ConfirmDialog.vue'
 import LibraryView from './views/LibraryView.vue'
 import TimelineView from './views/TimelineView.vue'
 import PlacesView from './views/PlacesView.vue'
@@ -10,17 +11,45 @@ import DuplicatesView from './views/DuplicatesView.vue'
 import QualityView from './views/QualityView.vue'
 import RestoreView from './views/RestoreView.vue'
 import OrganizeView from './views/OrganizeView.vue'
+import RecycleView from './views/RecycleView.vue'
 import SettingsView from './views/SettingsView.vue'
 import { api, native, waitForBackend } from './api'
-import { photoUrl } from './thumb'
+import { photoUrl, videoUrl } from './thumb'
 import {
   viewerState, close as closeViewer, step as stepViewer,
   toggleOriginal, requestRestore, gotoRestore as viewerGotoRestore,
   previewState, closeImage,
   zoomBy, setZoom, startDrag, onDrag, endDrag,
   previewZoomBy, previewStartDrag, previewOnDrag, previewEndDrag, previewReset,
-  markFavorite,
+  markFavorite, rotateBy,
 } from './viewer'
+
+/* 查看器里当前这张是不是视频 */
+const isVideoRow = computed(() => viewerState.row?.kind === 'video')
+
+/* 视频用系统播放器打开（软件内不带解码器，安装包才能保持 4 MB） */
+async function openVideoExternal() {
+  const p = viewerState.row?.path
+  if (p) await native.openPath(p)
+}
+
+/* 视频时长格式化：90 -> 1:30 */
+function fmtDur(sec) {
+  const t = Math.round(Number(sec) || 0)
+  if (t <= 0) return ''
+  const h = Math.floor(t / 3600)
+  const m = Math.floor((t % 3600) / 60)
+  const s = t % 60
+  const pad = n => String(n).padStart(2, '0')
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`
+}
+
+
+/* 在资源管理器里定位当前查看的文件 */
+async function revealCurrent() {
+  const p = viewerState.row?.path
+  if (p) await native.reveal(p)
+}
 
 const NAV_GROUPS = [
   {
@@ -44,6 +73,7 @@ const NAV_GROUPS = [
     label: '整理',
     items: [
       { id: 'organize', icon: 'organize', label: '整理归档', hint: '按地点与时间分类输出', lab: 'lab_organize' },
+      { id: 'recycle', icon: 'trash', label: '回收站', hint: '删除的文件可从这取回', lab: null },
     ],
   },
 ]
@@ -87,12 +117,6 @@ const meta = computed(() => META[current.value] || META.library)
 const SEARCHLESS = new Set(['restore', 'organize', 'settings'])
 const showTopSearch = computed(() => !SEARCHLESS.has(current.value))
 
-/* 已识别比例，用于标题栏里那条细进度条 */
-const analyzedPct = computed(() => {
-  const s = stats.value
-  if (!s || !s.total) return 0
-  return Math.round(100 * (s.analyzed || 0) / s.total)
-})
 const hoverId = ref('')
 const topMsg = ref('')
 const topBusy = ref(false)
@@ -103,6 +127,69 @@ const resetting = ref(false)
 /* 扫描弹窗状态 */
 const scanOpen = ref(false)
 const scanDone = ref(null)
+const scanMode = ref('incremental')
+const cancelling = ref(false)
+
+/* ---------------- 信息编辑弹窗 ---------------- */
+const editOpen = ref(false)
+const editBusy = ref(false)
+const editRow = ref(null)
+const editForm = ref({ date: '', place: '', note: '', tags: [] })
+const editTagText = ref('')
+
+function openEdit(row) {
+  if (!row) return
+  editRow.value = row
+  const d = (row.dt || '').slice(0, 10)
+  editForm.value = {
+    date: d,
+    place: row.place || '',
+    note: row.note || '',
+    tags: [...(row.tags || [])],
+  }
+  editTagText.value = ''
+  editOpen.value = true
+}
+
+function addEditTag() {
+  const t = editTagText.value.trim()
+  if (t && !editForm.value.tags.includes(t)) {
+    editForm.value.tags = [...editForm.value.tags, t]
+  }
+  editTagText.value = ''
+}
+
+function removeEditTag(t) {
+  editForm.value.tags = editForm.value.tags.filter(x => x !== t)
+}
+
+async function saveEdit() {
+  if (!editRow.value || editBusy.value) return
+  editBusy.value = true
+  const id = editRow.value.id
+  const f = editForm.value
+  const payload = {}
+  if (!f.date) payload.clear_date = true
+  else payload.date = f.date
+  if (!f.place) payload.clear_place = true
+  else payload.place = f.place
+  payload.note = f.note
+  const r = await api.editPhoto(id, payload)
+  if (r?.ok) {
+    await api.setPhotoTags(id, f.tags)
+    // 就地同步查看器与已打开列表里的这张
+    if (viewerState.row?.id === id) {
+      viewerState.row = { ...viewerState.row, dt: f.date ? `${f.date} 00:00:00` : null, place: f.place || null, note: f.note || null }
+    }
+    topMsg.value = '已保存修改'
+    window.dispatchEvent(new CustomEvent('opo:photo-edited', { detail: { id } }))
+  } else {
+    topMsg.value = '保存失败：' + (r?.error || '未知错误')
+  }
+  editBusy.value = false
+  editOpen.value = false
+  setTimeout(() => { topMsg.value = '' }, 4000)
+}
 const lab = ref({})
 
 /* 只关心这两项实验室开关；其余功能常驻 */
@@ -158,6 +245,29 @@ function goRestore(row) {
 }
 requestRestore(goRestore)
 
+/* 从已选目录里移除一个。
+ *
+ * 只删「目录登记」，不动磁盘文件，也不删已扫描的照片记录
+ * （照片仍在库里，只是下次扫描不会再从这个目录找新文件）。
+ * 想让它的照片也一起消失，用「清除扫描记录」。 */
+async function removeFolderAt(path) {
+  if (!path) return
+  const r = await api.removeRoot(path)
+  if (!r || !r.ok) {
+    topMsg.value = '移除失败：' + (r?.error || '未知错误')
+    return
+  }
+  roots.value = r.roots || roots.value.filter(x => x !== path)
+  folderCount.value = roots.value.length
+  // 被删的正好是当前显示的目录时，换成最后一个（或清空）
+  if (activeFolder.value === path) {
+    activeFolder.value = roots.value[roots.value.length - 1] || ''
+  }
+  topMsg.value = '已移除目录：' + path
+  window.dispatchEvent(new CustomEvent('opo:roots-changed'))
+  refreshStats()
+}
+
 async function refreshFolders() {
   const r = await api.roots()
   if (r && r.items) {
@@ -179,57 +289,24 @@ onMounted(async () => {
   refreshFolders()
   refreshStats()
   window.addEventListener('opo:lab-changed', refreshLab)
-  window.addEventListener('opo:index-reset', refreshStats)
+  // 索引重置会同时影响统计与目录清单（可能连目录一起清了），两者都要刷
+  window.addEventListener('opo:index-reset', () => { refreshStats(); refreshFolders() })
   window.addEventListener('opo:scan-done', refreshStats)
   window.addEventListener('opo:roots-changed', refreshFolders)
-  // 上次的记录还在就问一句，避免用户以为照片"丢了"或"重复了"
-  await checkStartup()
+  // 设置页的「开始扫描」也走顶部那套进度弹窗
+  window.addEventListener('opo:scan-request', onScanRequest)
+  // 有历史索引时直接恢复；清库只在设置/重置中显式进行。
+  window.dispatchEvent(new CustomEvent('opo:scan-done'))
 })
 
-/* ---------------- 启动询问 ---------------- */
-const startupAsk = ref(false)
-const startupInfo = ref({ total: 0, analyzed: 0, timeText: '' })
+onBeforeUnmount(() => {
+  if (pollTimer) clearInterval(pollTimer)
+})
 
-function fmtTime(ts) {
-  if (!ts) return '未知'
-  const d = new Date(ts * 1000)
-  const p = n => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
-         `${p(d.getHours())}:${p(d.getMinutes())}`
-}
+/* 「没添加目录就点了开始扫描」的提示弹窗 */
+const noFolderAsk = ref(false)
 
-async function checkStartup() {
-  const r = await api.startupState()
-  if (!r || !r.has_previous) return
-  startupInfo.value = {
-    total: r.total || 0,
-    analyzed: r.analyzed || 0,
-    timeText: fmtTime(r.last_scan),
-  }
-  startupAsk.value = true
-}
-
-function keepPreviousScan() {
-  startupAsk.value = false
-  refreshStats()
-  refreshFolders()
-}
-
-async function clearPreviousScan() {
-  startupAsk.value = false
-  resetting.value = true
-  // keepRoots=true：保留照片目录清单，清完直接能重新扫
-  const r = await api.resetIndex(true)
-  resetting.value = false
-  if (r && r.ok) {
-    topMsg.value = `已清除 ${r.removed || 0} 条扫描记录，点「开始扫描」重新建立索引`
-    await refreshStats()
-    await refreshFolders()
-    window.dispatchEvent(new CustomEvent('opo:index-reset'))
-  } else {
-    topMsg.value = '清除失败，请稍后再试'
-  }
-}
+/* 有历史索引时直接恢复；重置由设置页或顶部按钮显式执行。 */
 
 async function addFolderTop() {
   if (picking.value || topBusy.value) return
@@ -265,23 +342,35 @@ async function addFolderTop() {
 let pollTimer = null
 async function runAllTop() {
   if (topBusy.value) return
+  const roots = await api.roots()
+  const list = roots && roots.items ? roots.items : []
+  if (!list.length) {
+    // 不跳转页面，就地弹窗提示（跳走会打断用户当前在做的事）
+    noFolderAsk.value = true
+    return
+  }
+  await startScan(list)
+}
+
+/* 设置页发来的扫描请求 */
+function onScanRequest(e) {
+  const list = e?.detail?.roots
+  if (Array.isArray(list) && list.length) startScan(list)
+}
+
+/* 真正启动扫描。顶部按钮与设置页共用这一条路径，
+   进度弹窗也就自然一致了。 */
+async function startScan(list) {
+  if (topBusy.value) return
   topBusy.value = true
   topMsg.value = '正在连接处理引擎…'
   const ok = await waitForBackend(30000)
   if (!ok) {
     topBusy.value = false
-    topMsg.value = '处理引擎未响应。请确认 backend 文件夹与本程序在同一目录'
+    topMsg.value = '处理引擎未响应，请稍后再试'
     return
   }
-  const roots = await api.roots()
-  const list = roots && roots.items ? roots.items : []
-  if (!list.length) {
-    topBusy.value = false
-    topMsg.value = '请先点「选择文件夹」添加照片目录'
-    select('settings')
-    return
-  }
-  const r = await api.scanStart(list)
+  const r = await api.scanStart(list, scanMode.value === 'full')
   if (!r || !r.ok) {
     topBusy.value = false
     topMsg.value = '扫描失败：' + (r?.error || '后端无响应')
@@ -291,7 +380,20 @@ async function runAllTop() {
   progress.value = { phase: '准备中', percent: 0, done: 0, total: 0, detail: '' }
   scanOpen.value = true          // 弹窗显示进度
   scanDone.value = null
+  cancelling.value = false
+  window.dispatchEvent(new CustomEvent('opo:scan-started'))
+  if (pollTimer) clearInterval(pollTimer)
   pollTimer = setInterval(pollScan, 700)
+}
+
+async function cancelScan() {
+  if (cancelling.value) return
+  cancelling.value = true
+  const r = await api.scanCancel()
+  if (!r?.ok) {
+    cancelling.value = false
+    topMsg.value = r?.error || '取消扫描失败'
+  }
 }
 
 async function pollScan() {
@@ -309,15 +411,17 @@ async function pollScan() {
       setTimeout(() => { topMsg.value = '' }, 6000)
       return
     }
+    cancelling.value = false
     await refreshStats()
     refreshFolders()
-    // 保留弹窗，切换成"扫描完成"确认态
-    scanDone.value = { total: stats.value?.total || 0 }
+    window.dispatchEvent(new CustomEvent('opo:scan-done'))
+    scanDone.value = { total: stats.value?.total || 0, cancelled: !!p.cancelled }
   }
 }
 
 /* 用户点确认后才关闭弹窗并跳转照片库 */
 async function confirmScanDone() {
+  const wasCancelled = !!scanDone.value?.cancelled
   scanOpen.value = false
   scanDone.value = null
   progress.value = null
@@ -325,14 +429,19 @@ async function confirmScanDone() {
   const key = current.value
   current.value = ''
   setTimeout(() => { current.value = key }, 40)
-  topMsg.value = '扫描完成，共 ' + (stats.value?.total || 0) + ' 张照片'
+  topMsg.value = wasCancelled
+    ? '已取消扫描，已完成的分析已保留，可继续增量扫描'
+    : '扫描完成，共 ' + (stats.value?.total || 0) + ' 张照片'
   setTimeout(() => { topMsg.value = '' }, 5000)
 }
 
-/* 顶部垃圾桶：重置所有扫描结果与目录 */
+/* 顶部重置按钮：确认弹窗状态（与照片删除的确认框同一套样式） */
+const resetAsk = ref(false)
+
+/* 顶部重置按钮：走确认弹窗 */
 async function resetAllTop() {
   if (resetting.value) return
-  if (!confirm('将清除所有扫描记录和已添加的照片目录（原始照片文件不受影响）。继续？')) return
+  resetAsk.value = false
   resetting.value = true
   const r = await api.resetIndex(false)
   resetting.value = false
@@ -430,7 +539,13 @@ watch(current, (v) => { if (v === 'library' || v === 'places') refreshStats() })
               <div class="folder-pop-head">已选 {{ folderCount }} 个目录</div>
               <div v-for="(r, i) in roots" :key="r" class="folder-pop-row">
                 <span class="idx">{{ i + 1 }}</span>
-                <span class="path">{{ r }}</span>
+                <span class="path" :title="r">{{ r }}</span>
+                <button
+                  class="folder-pop-del" title="移除这个目录"
+                  @click.stop.prevent="removeFolderAt(r)"
+                >
+                  <Icon name="close" :size="12" />
+                </button>
               </div>
             </div>
           </div>
@@ -440,48 +555,53 @@ watch(current, (v) => { if (v === 'library' || v === 'places') refreshStats() })
         <div class="header-right">
           <label v-if="showTopSearch" class="search">
             <Icon name="search" :size="17" />
-            <input v-model="search" placeholder="搜索照片、地点或日期" />
+            <input v-model="search" placeholder="搜索文件名、目录或地点（空格分隔多个词）" />
             <button v-if="search" class="search-clear" @click="search = ''">✕</button>
           </label>
           <button class="btn btn-ghost" :disabled="picking || topBusy" @click="addFolderTop">
             <Icon name="folder" :size="17" /> {{ picking ? '选择中…' : '选择文件夹' }}
           </button>
-          <button class="btn btn-primary" :disabled="topBusy || picking" @click="runAllTop">
-            <Icon name="sparkle" :size="17" /> {{ topBusy ? '扫描中…' : '开始扫描' }}
+          <button class="btn btn-primary" :disabled="topBusy || picking" @click="topBusy ? (scanOpen = true) : runAllTop()">
+            <Icon name="sparkle" :size="17" /> {{ topBusy ? '查看扫描进度' : '开始扫描' }}
           </button>
           <button
-            class="btn btn-danger-ghost" :disabled="resetting || topBusy"
+            class="btn btn-ghost" :disabled="resetting || topBusy"
             title="重置：清除所有扫描记录与目录（不删除原文件）"
-            @click="resetAllTop"
+            @click="resetAsk = true"
           >
-            <Icon name="trash" :size="17" />
+            <Icon name="rotateLeft" :size="16" />
           </button>
         </div>
       </header>
 
-      <!-- 启动询问：上次扫描记录还在，问要不要清掉 -->
-      <div v-if="startupAsk" class="scan-mask">
+      <!-- 重置确认：与其他确认框同一套样式。图标用循环箭头，语义是"回到初始" -->
+      <ConfirmDialog
+        :show="resetAsk"
+        title="重置所有扫描记录？"
+        message="将清除全部扫描记录和已添加的照片目录，回到刚安装的状态。原始照片文件不受影响。"
+        detail="清除后需要重新添加目录并扫描。"
+        confirm-text="重置"
+        level="danger"
+        icon="rotateLeft"
+        :busy="resetting"
+        @confirm="resetAllTop"
+        @cancel="resetAsk = false"
+      />
+
+      <!-- 没添加目录就点开始扫描：就地提示，不跳页 -->
+      <div v-if="noFolderAsk" class="scan-mask" @click.self="noFolderAsk = false">
         <div class="scan-dialog startup-dialog">
           <div class="scan-title">
-            <Icon name="clock" :size="18" />
-            发现上次的扫描记录
+            <Icon name="folder" :size="18" />
+            还没有添加照片目录
           </div>
           <div class="scan-detail">
-            上次扫描：<b>{{ startupInfo.timeText }}</b><br>
-            共 <b>{{ startupInfo.total }}</b> 张照片
-            <template v-if="startupInfo.analyzed < startupInfo.total">
-              （已分析 {{ startupInfo.analyzed }} 张）
-            </template>
-          </div>
-          <div class="startup-tip">
-            清除后需要重新扫描才能看照片；原始照片文件不受影响。
+            先选一个装着照片或视频的文件夹，再回来点「开始扫描」。
           </div>
           <div class="scan-actions startup-actions">
-            <button class="btn" @click="keepPreviousScan">
-              保留，直接看
-            </button>
-            <button class="btn btn-danger" @click="clearPreviousScan">
-              <Icon name="trash" :size="16" /> 清除并重新开始
+            <button class="btn" @click="noFolderAsk = false">知道了</button>
+            <button class="btn btn-primary" @click="noFolderAsk = false; addFolderTop()">
+              <Icon name="folder" :size="16" /> 现在选择文件夹
             </button>
           </div>
         </div>
@@ -505,14 +625,30 @@ watch(current, (v) => { if (v === 'library' || v === 'places') refreshStats() })
                 <template v-if="progress?.total"> · {{ progress.done }}/{{ progress.total }}</template>
               </span>
             </div>
+            <div class="scan-mode">
+              <select v-model="scanMode" :disabled="cancelling" aria-label="扫描方式">
+                <option value="incremental">增量扫描（只分析新增和已修改）</option>
+                <option value="full">重新全部分析</option>
+              </select>
+            </div>
             <div v-if="progress?.detail" class="scan-detail">{{ progress.detail }}</div>
-            <div class="scan-tip">扫描期间请勿关闭窗口，完成后会提示确认</div>
+            <div class="scan-tip">
+              {{ cancelling ? '正在停止，已完成的分析会保留…' : '扫描期间可以切换到其他页面，或取消后继续整理' }}
+            </div>
+            <div class="scan-actions">
+              <button class="btn" :disabled="cancelling" @click="scanOpen = false">后台运行</button>
+              <button class="btn btn-danger" :disabled="cancelling" @click="cancelScan">
+                {{ cancelling ? '正在取消…' : '取消扫描' }}
+              </button>
+            </div>
           </template>
 
           <template v-else>
-            <div class="scan-done-ico"><Icon name="check" :size="26" /></div>
-            <div class="scan-title done">扫描完成</div>
-            <div class="scan-detail">共识别 <b>{{ scanDone.total }}</b> 张照片</div>
+            <div class="scan-done-ico"><Icon :name="scanDone.cancelled ? 'clock' : 'check'" :size="26" /></div>
+            <div class="scan-title done">{{ scanDone.cancelled ? '扫描已取消' : '扫描完成' }}</div>
+            <div class="scan-detail">
+              {{ scanDone.cancelled ? '已完成的分析已保留，下次增量扫描会处理剩余照片。' : `共识别 ${scanDone.total} 个文件（照片与视频）` }}
+            </div>
             <div class="scan-actions">
               <button class="btn btn-primary" @click="confirmScanDone">
                 <Icon name="check" :size="16" /> 确定，去看照片
@@ -539,6 +675,7 @@ watch(current, (v) => { if (v === 'library' || v === 'places') refreshStats() })
         <QualityView v-else-if="current === 'quality'" :search="search" @repair="goRestore" />
         <RestoreView v-else-if="current === 'restore'" :pick="restorePick" />
         <OrganizeView v-else-if="current === 'organize'" />
+        <RecycleView v-else-if="current === 'recycle'" />
         <SettingsView v-else-if="current === 'settings'" />
       </main>
 
@@ -554,31 +691,59 @@ watch(current, (v) => { if (v === 'library' || v === 'places') refreshStats() })
         @keydown.equal.prevent="zoomBy(1.25)"
         @keydown.minus.prevent="zoomBy(0.8)"
         @keydown.0.prevent="setZoom(1)"
+        @keydown.r.prevent="rotateBy(90)"
+        @keydown.shift.r.prevent="rotateBy(-90)"
       >
         <div class="viewer-dialog">
+          <!-- 顶栏：只留文件名、分页和关闭。操作按钮全部下移到悬浮组件 -->
           <div class="viewer-bar">
-            <strong class="ellipsis">{{ viewerState.row?.name || '照片' }}</strong>
-            <div class="viewer-actions">
-              <button @click="zoomBy(0.8)" title="缩小（-）">−</button>
-              <button class="zoom-label" title="点击复位 100%" @click="setZoom(1)">{{ Math.round(viewerState.zoom * 100) }}%</button>
-              <button @click="zoomBy(1.25)" title="放大（+）">＋</button>
-              <button @click="toggleOriginal">
-                <Icon name="eye" :size="14" />
-                {{ viewerState.showOriginal ? '适应窗口' : '原始尺寸' }}
+            <strong class="ellipsis">
+              <Icon v-if="isVideoRow" name="video" :size="14" />
+              {{ viewerState.row?.name || '照片' }}
+            </strong>
+            <span class="viewer-pager">{{ viewerState.index + 1 }} / {{ viewerState.list.length }}</span>
+            <button class="viewer-close" title="关闭（Esc）" @click="closeViewer">
+              <Icon name="close" :size="15" />
+            </button>
+          </div>
+
+          <!-- 标签移到顶部，紧贴文件信息 -->
+          <div v-if="viewerState.tags.length" class="viewer-tags top">
+            <span v-for="t in viewerState.tags" :key="t">{{ t }}</span>
+          </div>
+
+          <!-- 视频：不内嵌播放（不带解码器），点击用系统播放器打开 -->
+          <div v-if="isVideoRow" class="viewer-video">
+            <div class="video-holder">
+              <div class="video-ico"><Icon name="video" :size="46" /></div>
+              <strong class="video-name">{{ viewerState.row?.name }}</strong>
+              <p class="video-tip">
+                视频由系统播放器打开
+              </p>
+              <button class="btn btn-primary" @click="openVideoExternal">
+                <Icon name="play" :size="16" /> 用系统播放器打开
               </button>
-              <button @click="stepViewer(-1)">← 上一张</button>
-              <button @click="stepViewer(1)">下一张 →</button>
-              <button @click="toggleFavInViewer">
-                <Icon :name="viewerState.row?.favorite ? 'starFilled' : 'star'" :size="14" />
-                {{ viewerState.row?.favorite ? '取消收藏' : '收藏' }}
-              </button>
-              <button @click="viewerGotoRestore()">
-                <Icon name="wrench" :size="14" /> 去修复
-              </button>
-              <button @click="closeViewer">关闭</button>
             </div>
           </div>
+
+          <!-- 左右切换：照片与视频都能用，绝对定位在内容区两侧 -->
+          <button
+            v-if="viewerState.list.length > 1"
+            class="nav-arrow left" title="上一张（←）"
+            @click.stop="stepViewer(-1)"
+          >
+            <Icon name="chevronLeft" :size="26" />
+          </button>
+          <button
+            v-if="viewerState.list.length > 1"
+            class="nav-arrow right" title="下一张（→）"
+            @click.stop="stepViewer(1)"
+          >
+            <Icon name="chevronRight" :size="26" />
+          </button>
+
           <div
+            v-if="!isVideoRow"
             class="viewer-image" :class="{ original: viewerState.showOriginal, grab: viewerState.zoom > 1 }"
             @wheel.prevent="zoomBy($event.deltaY < 0 ? 1.12 : 0.89)"
             @mousedown="startDrag"
@@ -589,18 +754,58 @@ watch(current, (v) => { if (v === 'library' || v === 'places') refreshStats() })
             <img
               :src="photoUrl(viewerState.row)"
               :alt="viewerState.row?.name || ''"
-              :style="{ transform: `translate(${viewerState.offsetX}px, ${viewerState.offsetY}px) scale(${viewerState.zoom})` }"
+              :style="{
+                transform: `translate(${viewerState.offsetX}px, ${viewerState.offsetY}px) ` +
+                           `scale(${viewerState.zoom}) rotate(${viewerState.rotate}deg)`,
+                transition: (viewerState.dragging || viewerState.noTransition)
+                  ? 'none' : 'transform .16s ease',
+              }"
             />
           </div>
-          <div class="viewer-info">
-            <span>{{ (viewerState.row?.dt || '无日期').slice(0, 19) }}</span>
-            <span v-if="viewerState.row?.place">{{ viewerState.row.place }}</span>
-            <span>{{ viewerState.row?.width }} × {{ viewerState.row?.height }}</span>
-            <span class="ellipsis">{{ viewerState.row?.path }}</span>
-            <span class="pager">{{ viewerState.index + 1 }} / {{ viewerState.list.length }}</span>
-          </div>
-          <div v-if="viewerState.tags.length" class="viewer-tags">
-            <span v-for="t in viewerState.tags" :key="t">{{ t }}</span>
+          <!-- 底部悬浮操作组件：毛玻璃胶囊，悬停图片时更实 -->
+          <div class="viewer-dock">
+            <div class="dock-meta">
+              <span>{{ (viewerState.row?.dt || '无日期').slice(0, 19) }}</span>
+              <span v-if="viewerState.row?.place">{{ viewerState.row.place }}</span>
+              <span v-if="isVideoRow && viewerState.row?.duration">时长 {{ fmtDur(viewerState.row.duration) }}</span>
+              <span v-else>{{ viewerState.row?.width }} × {{ viewerState.row?.height }}</span>
+            </div>
+            <div class="dock-acts">
+              <template v-if="!isVideoRow">
+                <button class="dock-btn" title="向左旋转（Shift+R）" @click="rotateBy(-90)">
+                  <Icon name="rotateLeft" :size="16" />
+                </button>
+                <button class="dock-btn" title="向右旋转（R）" @click="rotateBy(90)">
+                  <Icon name="rotateRight" :size="16" />
+                </button>
+                <span class="dock-sep"></span>
+                <button class="dock-btn" title="缩小（-）" @click="zoomBy(0.8)">−</button>
+                <button class="dock-btn pct" title="点击复位 100%" @click="setZoom(1)">
+                  {{ Math.round(viewerState.zoom * 100) }}%
+                </button>
+                <button class="dock-btn" title="放大（+）" @click="zoomBy(1.25)">＋</button>
+                <button class="dock-btn" title="切换原始尺寸/适应窗口" @click="toggleOriginal">
+                  <Icon name="eye" :size="16" />
+                </button>
+                <span class="dock-sep"></span>
+              </template>
+              <button
+                class="dock-btn" :class="{ on: viewerState.row?.favorite }"
+                :title="viewerState.row?.favorite ? '取消收藏' : '收藏'"
+                @click="toggleFavInViewer"
+              >
+                <Icon :name="viewerState.row?.favorite ? 'starFilled' : 'star'" :size="16" />
+              </button>
+              <button class="dock-btn" title="在资源管理器中定位" @click="revealCurrent">
+                <Icon name="folder" :size="16" />
+              </button>
+              <button class="dock-btn" title="编辑日期、地点、标签与备注" @click="openEdit(viewerState.row)">
+                <Icon name="edit" :size="16" />
+              </button>
+              <button v-if="!isVideoRow" class="dock-btn" title="去修复" @click="viewerGotoRestore()">
+                <Icon name="wrench" :size="16" />
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -645,13 +850,63 @@ watch(current, (v) => { if (v === 'library' || v === 'places') refreshStats() })
     </div>
     </div>
   </div>
+
+  <!-- 信息编辑弹窗 -->
+  <div v-if="editOpen" class="edit-mask" @click.self="editOpen = false">
+    <div class="edit-dialog card">
+      <div class="edit-head">
+        <strong>编辑照片信息</strong>
+        <button class="edit-close" @click="editOpen = false"><Icon name="close" :size="15" /></button>
+      </div>
+      <div class="edit-name">{{ editRow?.name || '照片' }}</div>
+
+      <label class="edit-field">
+        <span>拍摄日期</span>
+        <input v-model="editForm.date" type="date" placeholder="YYYY-MM-DD" />
+      </label>
+      <label class="edit-field">
+        <span>地点</span>
+        <input v-model="editForm.place" type="text" placeholder="例如：北京 · 故宫" />
+      </label>
+      <label class="edit-field">
+        <span>备注</span>
+        <textarea v-model="editForm.note" rows="2" placeholder="补充说明，仅保存在本机"></textarea>
+      </label>
+
+      <div class="edit-field">
+        <span>标签</span>
+        <div class="edit-tags">
+          <span v-for="t in editForm.tags" :key="t" class="edit-tag">
+            {{ t }} <button @click="removeEditTag(t)">×</button>
+          </span>
+          <input
+            v-model="editTagText" class="edit-tag-input" placeholder="输入后回车添加"
+            @keydown.enter.prevent="addEditTag" @blur="addEditTag"
+          />
+        </div>
+      </div>
+
+      <p class="edit-tip">修改只写进本软件数据库，不改动原照片文件；重新扫描时会保留你的修改。</p>
+      <div class="edit-actions">
+        <button class="btn" :disabled="editBusy" @click="editOpen = false">取消</button>
+        <button class="btn btn-primary" :disabled="editBusy" @click="saveEdit">
+          {{ editBusy ? '保存中…' : '保存' }}
+        </button>
+      </div>
+    </div>
+  </div>
 </template>
 
 <style scoped>
-/* 无边框窗口的圆角外框：外层透明留出阴影空间，内层才是真正的窗口内容 */
+/* 无边框窗口的圆角外框。
+ *
+ * 之前外层留了 6px 透明 padding 来「放阴影」，但窗口本身是透明的：
+ * 那 6px 在深色桌面上就是一圈黑边，看起来像窗口没对齐。
+ * 现在铺满整个窗口，圆角直接由窗口自身裁切，不再留透明缝。
+ */
 .app-frame {
   height: 100vh; width: 100vw;
-  padding: 6px;
+  padding: 0;
   margin: 0;
   background: transparent;
   overflow: hidden;
@@ -663,22 +918,22 @@ watch(current, (v) => { if (v === 'library' || v === 'places') refreshStats() })
   border-radius: 12px;
   overflow: hidden;
   background: var(--page-bg);
-  border: 1px solid var(--line-strong);
-  box-shadow: 0 10px 34px rgba(0, 0, 0, .55);
+  /* 细描边改成向内收，避免在浅色桌面上出现深色轮廓 */
+  border: 0;
+  box-shadow: inset 0 0 0 1px var(--line-strong);
   box-sizing: border-box;
 }
-/* 最大化时去掉圆角、边框与留白，铺满屏幕 */
+/* 最大化时连圆角也去掉，彻底铺满 */
 :global(.app-maximized) .app-frame { padding: 0; }
 :global(.app-maximized) .app-body {
   border-radius: 0;
-  border-color: transparent;
   box-shadow: none;
 }
 .shell { display: flex; flex: 1; min-height: 0; background: var(--page-bg); }
 .rail {
   position: relative; z-index: 30; display: flex; width: 72px; flex: none;
   flex-direction: column; padding: 14px 0 12px; gap: 4px;
-  overflow: visible; background: var(--page-bg);
+  overflow: visible; background: var(--rail-bg, var(--page-bg));
 }
 .rail-nav { display: flex; flex-direction: column; align-items: center; gap: 4px; flex: 1; overflow: visible; width: 72px; }
 .brand { display: flex; align-items: center; justify-content: center; height: 48px; margin-bottom: 8px; flex: none; }
@@ -749,7 +1004,7 @@ watch(current, (v) => { if (v === 'library' || v === 'places') refreshStats() })
   padding: 3px 8px 7px; font-size: var(--fs-xs); color: var(--text-tertiary);
   border-bottom: 1px solid var(--line); margin-bottom: 5px;
 }
-.folder-pop-row { display: flex; gap: 8px; padding: 5px 8px; border-radius: var(--r-xs); }
+.folder-pop-row { display: flex; gap: 8px; padding: 5px 8px; border-radius: var(--r-xs); align-items: center; }
 .folder-pop-row:hover { background: var(--surface-hover); }
 .folder-pop-row .idx {
   flex: none; width: 18px; color: var(--text-tertiary);
@@ -759,6 +1014,15 @@ watch(current, (v) => { if (v === 'library' || v === 'places') refreshStats() })
   flex: 1; min-width: 0; font-size: var(--fs-xs); color: var(--text-secondary);
   word-break: break-all; line-height: 1.5;
 }
+/* 每行的移除按钮：默认淡显，悬停该行时明显 */
+.folder-pop-del {
+  flex: none; width: 20px; height: 20px;
+  display: grid; place-items: center;
+  border-radius: 4px; color: var(--text-tertiary);
+  opacity: 0; transition: opacity .12s ease, background .12s ease, color .12s ease;
+}
+.folder-pop-row:hover .folder-pop-del { opacity: 1; }
+.folder-pop-del:hover { background: rgba(239,68,68,.16); color: var(--danger); }
 
 .btn-danger-ghost { background: rgba(239,68,68,.12); color: var(--danger); padding: 0 12px; }
 .btn-danger-ghost:hover { background: rgba(239,68,68,.22); }
@@ -794,6 +1058,17 @@ watch(current, (v) => { if (v === 'library' || v === 'places') refreshStats() })
 .startup-actions {
   justify-content: flex-end; gap: 10px; display: flex;
 }
+/* 清除记录时的「同时清目录」勾选项 */
+.startup-opt {
+  display: flex; align-items: center; gap: 8px;
+  margin-bottom: 16px; padding: 8px 10px;
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  font-size: var(--fs-xs); color: var(--text-secondary);
+  cursor: pointer; user-select: none;
+}
+.startup-opt:hover { background: var(--surface-3); }
+.startup-opt input { width: 14px; height: 14px; accent-color: var(--danger); cursor: pointer; flex: none; }
 .btn-danger {
   background: rgba(239,68,68,.14);
   color: var(--danger);
@@ -826,7 +1101,71 @@ watch(current, (v) => { if (v === 'library' || v === 'places') refreshStats() })
   display: grid; place-items: center; width: 54px; height: 54px; margin: 0 auto 14px;
   border-radius: 50%; background: rgba(34,197,94,.14); color: var(--success);
 }
-.scan-actions { display: flex; justify-content: center; margin-top: 20px; }
+.scan-actions { display: flex; justify-content: center; gap: 10px; margin-top: 20px; }
+.scan-mode { margin-top: 16px; text-align: left; }
+.scan-mode select {
+  width: 100%; padding: 9px 11px; border-radius: var(--r-sm);
+  background: var(--surface-2); color: var(--text-primary);
+  border: 1px solid var(--line); font-size: var(--fs-sm);
+}
+
+/* 信息编辑弹窗 */
+.edit-mask {
+  position: fixed; inset: 0; z-index: 200;
+  display: grid; place-items: center;
+  background: rgba(6,8,12,.72); backdrop-filter: blur(6px);
+}
+.edit-dialog {
+  width: min(420px, 92vw); padding: 22px 24px;
+  border-radius: var(--r-xl); background: var(--surface);
+  box-shadow: var(--shadow-lg);
+  max-height: 88vh; overflow-y: auto;
+}
+.edit-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 6px;
+}
+.edit-head strong { font-size: var(--fs-lg); }
+.edit-close {
+  display: grid; place-items: center; width: 26px; height: 26px;
+  border-radius: var(--r-xs); color: var(--text-tertiary);
+}
+.edit-close:hover { background: var(--surface-3); color: var(--text-primary); }
+.edit-name {
+  margin-bottom: 14px; font-size: var(--fs-sm); color: var(--text-tertiary);
+  word-break: break-all;
+}
+.edit-field {
+  display: flex; flex-direction: column; gap: 6px;
+  margin-bottom: 12px; font-size: var(--fs-sm); color: var(--text-secondary);
+}
+.edit-field input, .edit-field select, .edit-field textarea {
+  padding: 9px 11px; border-radius: var(--r-sm);
+  background: var(--surface-2); color: var(--text-primary);
+  border: 1px solid var(--line); font-size: var(--fs-sm);
+  font-family: inherit; resize: vertical;
+}
+.edit-tags {
+  display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+  padding: 7px 9px; border-radius: var(--r-sm);
+  background: var(--surface-2); border: 1px solid var(--line);
+}
+.edit-tag {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 8px; border-radius: var(--r-pill);
+  background: var(--tint-strong); color: var(--brand-300); font-size: var(--fs-xs);
+}
+.edit-tag button { color: var(--brand-300); font-size: 13px; line-height: 1; }
+.edit-tag-input {
+  flex: 1; min-width: 90px; padding: 3px 6px;
+  background: transparent; border: 0; color: var(--text-primary);
+  font-size: var(--fs-xs);
+}
+.edit-tip {
+  margin: 2px 0 16px; font-size: var(--fs-xs);
+  color: var(--text-tertiary); line-height: 1.6;
+}
+.edit-actions { display: flex; justify-content: flex-end; gap: 10px; }
 .header-right { display: flex; align-items: center; gap: 10px; }
 /* 搜索框等控件整体左移一点，给右侧垃圾桶留出呼吸感 */
 .header { padding-right: 10px; }
@@ -872,7 +1211,15 @@ watch(current, (v) => { if (v === 'library' || v === 'places') refreshStats() })
 .progress-fill { height: 100%; border-radius: var(--r-pill); background: var(--grad-blue); transition: width .3s var(--ease); }
 .progress-pct { min-width: 38px; color: var(--brand-300); font-variant-numeric: tabular-nums; font-weight: 600; }
 .progress-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.content { flex: 1; min-height: 0; overflow: hidden; padding-bottom: 16px; }
+.content {
+  flex: 1; min-height: 0; overflow: hidden; padding-bottom: 16px;
+  position: relative;
+}
+/* 环境光晕：随强调色变化的一层极淡背景光，让"换主题"有整体氛围变化 */
+.content::before {
+  content: ''; position: absolute; inset: 0; pointer-events: none;
+  background: radial-gradient(120% 60% at 50% -10%, var(--ambient-glow, transparent), transparent 70%);
+}
 .toast {
   position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%); z-index: 90;
   padding: 11px 22px; border-radius: var(--r-pill); background: var(--surface-3);
@@ -883,27 +1230,78 @@ watch(current, (v) => { if (v === 'library' || v === 'places') refreshStats() })
 .toast-enter-from, .toast-leave-to { opacity: 0; transform: translateX(-50%) translateY(8px); }
 .viewer-overlay {
   position: fixed; inset: 0; z-index: 95; display: grid; place-items: center;
-  padding: 20px; background: rgba(6,8,12,.86); backdrop-filter: blur(8px);
+  padding: 12px; background: rgba(6,8,12,.86); backdrop-filter: blur(8px);
 }
 .viewer-dialog {
-  display: flex; flex-direction: column; width: min(1240px, 95vw);
-  height: min(900px, 94vh); border-radius: var(--r-xl);
+  position: relative;
+  display: flex; flex-direction: column; width: min(1680px, 97vw);
+  height: min(1040px, 96vh); border-radius: var(--r-xl);
   background: var(--surface); box-shadow: var(--shadow-lg); overflow: hidden;
 }
 .viewer-bar {
-  display: flex; align-items: center; justify-content: space-between;
-  gap: 16px; flex: none; padding: 11px 16px; border-bottom: 1px solid var(--line);
+  display: flex; align-items: center; gap: 14px;
+  flex: none; padding: 12px 16px;
 }
-.viewer-actions { display: flex; gap: 7px; flex: none; }
-.viewer-actions button {
-  display: inline-flex; align-items: center; gap: 5px; padding: 7px 12px;
-  border-radius: var(--r-sm); background: var(--surface-2); font-size: var(--fs-sm);
+.viewer-bar strong { flex: 1; min-width: 0; font-size: var(--fs-md); font-weight: 600; }
+.viewer-pager {
+  flex: none; font-size: var(--fs-xs); color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
 }
-.viewer-actions button:hover { background: var(--surface-3); }
-.zoom-label { min-width: 58px; color: var(--brand-300); font-variant-numeric: tabular-nums; }
+.viewer-close {
+  flex: none; width: 30px; height: 30px;
+  display: grid; place-items: center;
+  border-radius: var(--r-sm);
+  color: var(--text-tertiary);
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.viewer-close:hover { background: rgba(239,68,68,.16); color: var(--danger); }
 .viewer-image {
   position: relative; flex: 1; min-height: 0; display: grid; place-items: center;
-  padding: 14px; background: #07090d; overflow: auto;
+  /* 不要内边距：图片用 inset:0 撑满，任何 padding 都会在四周露出一圈深色底，
+     看起来就是"图片放不满、边框发黑" */
+  padding: 0; background: #07090d; overflow: auto;
+}
+
+/* 左右切换箭头：贴边垂直居中，平时半透明，悬停变实 */
+.nav-arrow {
+  position: absolute; top: 50%; transform: translateY(-50%);
+  width: 44px; height: 76px; z-index: 5;
+  display: grid; place-items: center;
+  border-radius: 10px;
+  background: rgba(0,0,0,.42); color: #fff;
+  opacity: .35;
+  transition: opacity .15s ease, background .15s ease;
+}
+.nav-arrow.left { left: 8px; }
+.nav-arrow.right { right: 8px; }
+.nav-arrow:hover { opacity: 1; background: rgba(0,0,0,.72); }
+.nav-arrow:active { transform: translateY(-50%) scale(.94); }
+
+/* 视频区：不内嵌播放器（软件不带解码器），显示引导卡片 */
+.viewer-video {
+  position: relative; flex: 1; min-height: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: #07090d; padding: 24px;
+}
+.video-holder {
+  display: flex; flex-direction: column; align-items: center; gap: 14px;
+  max-width: 460px; text-align: center;
+}
+.video-ico {
+  display: grid; place-items: center;
+  width: 88px; height: 88px;
+  border-radius: 24px;
+  background: linear-gradient(145deg, rgba(90,174,254,.18), rgba(59,149,247,.08));
+  border: 1px solid rgba(90,174,254,.22);
+  color: var(--brand-300);
+}
+.video-name {
+  font-size: var(--fs-lg); font-weight: 600; color: #e8e8ea;
+  word-break: break-all;
+}
+.video-tip {
+  margin: 0; font-size: var(--fs-sm); line-height: 1.65;
+  color: var(--text-tertiary);
 }
 /* 关键：用 absolute 撑满容器再 contain，百分比高度在滚动容器里不可靠，
    高分辨率图会被顶出可视区（之前"显示不全"就是这个原因）。 */
@@ -911,7 +1309,8 @@ watch(current, (v) => { if (v === 'library' || v === 'places') refreshStats() })
   position: absolute; inset: 0; margin: auto;
   width: 100%; height: 100%;
   object-fit: contain;
-  border-radius: var(--r-sm);
+  /* 图片本身不要圆角：留着会在四角透出容器的深色底 */
+  border-radius: 0;
   transform-origin: center center;
   user-select: none; -webkit-user-drag: none;
   transition: transform .08s linear;
@@ -923,12 +1322,62 @@ watch(current, (v) => { if (v === 'library' || v === 'places') refreshStats() })
   position: static; inset: auto; margin: 0;
   width: auto; height: auto; max-width: none; max-height: none;
 }
-.viewer-info {
-  display: flex; gap: 16px; flex: none; padding: 9px 16px;
-  font-size: var(--fs-xs); color: var(--text-tertiary);
-}
-.viewer-info span:nth-last-child(2) { flex: 1; min-width: 0; }
-.pager { flex: none; color: var(--text-secondary); }
 .viewer-tags { display: flex; flex-wrap: wrap; gap: 7px; flex: none; padding: 0 16px 13px; }
 .viewer-tags span { padding: 4px 10px; border-radius: var(--r-pill); background: var(--tint); color: var(--brand-300); font-size: var(--fs-xs); }
+/* 顶部标签：紧贴文件名下方，间距收紧 */
+.viewer-tags.top { padding: 0 16px 10px; }
+
+/* ==========================================================================
+   底部悬浮操作组件
+   --------------------------------------------------------------------------
+   原来是横跨整个窗口的信息条，占了很大一块。改成悬浮在图片上的毛玻璃胶囊：
+   平时半透明融入画面，鼠标移入变实，不遮挡照片也不抢视线。
+   ========================================================================== */
+.viewer-dock {
+  position: absolute; left: 50%; bottom: 18px; transform: translateX(-50%);
+  z-index: 8;
+  display: flex; flex-direction: column; align-items: center; gap: 7px;
+  padding: 9px 12px;
+  border-radius: var(--r-lg);
+  background: rgba(20, 23, 28, .72);
+  backdrop-filter: blur(18px) saturate(1.6);
+  -webkit-backdrop-filter: blur(18px) saturate(1.6);
+  border: 1px solid rgba(255, 255, 255, .10);
+  box-shadow: 0 10px 34px rgba(0, 0, 0, .48);
+  opacity: .92;
+  transition: opacity .18s ease, background .18s ease;
+  max-width: calc(100% - 120px);
+}
+.viewer-dock:hover { opacity: 1; background: rgba(20, 23, 28, .92); }
+
+.dock-meta {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  justify-content: center;
+  font-size: var(--fs-xs); color: rgba(255,255,255,.62);
+  max-width: 100%;
+}
+.dock-meta span { white-space: nowrap; }
+
+.dock-acts { display: flex; align-items: center; gap: 4px; }
+.dock-btn {
+  display: grid; place-items: center;
+  min-width: 32px; height: 32px; padding: 0 8px;
+  border-radius: var(--r-sm);
+  color: rgba(255,255,255,.80);
+  font-size: var(--fs-sm);
+  transition: background .14s ease, color .14s ease;
+}
+.dock-btn:hover { background: rgba(255,255,255,.14); color: #fff; }
+.dock-btn.on { color: #fbbf24; }
+.dock-btn.pct {
+  min-width: 52px;
+  color: #8ac6ff;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+.dock-sep {
+  width: 1px; height: 18px; flex: none;
+  background: rgba(255,255,255,.14);
+  margin: 0 3px;
+}
 </style>

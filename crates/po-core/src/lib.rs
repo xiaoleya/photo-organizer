@@ -12,6 +12,7 @@ pub mod report;
 pub mod restore;
 pub mod scanner;
 pub mod util;
+pub mod video;
 
 pub use config::{load_settings, save_settings, Settings};
 pub use library::Library;

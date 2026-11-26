@@ -21,6 +21,9 @@ const PATHS = {
   folder: 'M3 7.5A1.5 1.5 0 0 1 4.5 6h4l2 2.5h8A1.5 1.5 0 0 1 20 10v7.5a1.5 1.5 0 0 1-1.5 1.5h-14A1.5 1.5 0 0 1 3 17.5v-10Z',
   chevronDown: 'm6 9 6 6 6-6',
   chevronRight: 'm9 6 6 6-6 6',
+  chevronLeft: 'm15 6-6 6 6 6',
+  rotateLeft: 'M9 4 5 8l4 4M5 8h9a5 5 0 0 1 0 10H8',
+  rotateRight: 'M15 4l4 4-4 4M19 8h-9a5 5 0 0 0 0 10h6',
   close: 'M6 6l12 12M18 6 6 18',
   minimize: 'M5 12h14',
   maximize: 'M5 5h14v14H5z',
@@ -29,6 +32,8 @@ const PATHS = {
   check: 'm5 13 4 4L19 7',
   trash: 'M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2m-9 0 1 13h10l1-13',
   image: 'M4 5h16v14H4zM4 15l4.5-4.5 4 4L16 11l4 4',
+  play: 'M8 5.5v13l11-6.5z',
+  video: 'M4 6h11v12H4zM15 10l5-3v10l-5-3z',
   grid: 'M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z',
   list: 'M8 6h13M8 12h13M8 18h13M3.5 6h.01M3.5 12h.01M3.5 18h.01',
   filter: 'M3 5h18l-7 8v6l-4 2v-8L3 5Z',
@@ -53,6 +58,7 @@ const PATHS = {
   eye: 'M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12Zm9.5 3a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z',
   download: 'M12 4v11m0 0 4-4m-4 4-4-4M4 19h16',
   compare: 'M12 3v18M5 7h4v10H5zM15 7h4v10h-4z',
+  edit: 'M4 20h4l10.5-10.5a2 2 0 0 0-4-4L4 16v4Z',
 }
 </script>
 

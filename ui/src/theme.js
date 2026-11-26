@@ -14,6 +14,9 @@ export const ACCENTS = [
       400: '#5aaefe', 500: '#3b95f7', 600: '#2478e0', 700: '#1b5fbb',
       rgb: '59, 149, 247',
     },
+    /* 每种强调色配套的页面氛围：底色色相、环境光颜色。
+       切换强调色时整个界面的"气质"跟着变，不只是按钮换色。 */
+    mood: { dark: '#0f1115', light: '#f4f6fa', glow: 'rgba(59,149,247,.07)' },
   },
   {
     id: 'cyan', label: '青色',
@@ -22,6 +25,7 @@ export const ACCENTS = [
       400: '#22d3ee', 500: '#06b6d4', 600: '#0891b2', 700: '#0e7490',
       rgb: '6, 182, 212',
     },
+    mood: { dark: '#0c1215', light: '#f2f9fa', glow: 'rgba(6,182,212,.07)' },
   },
   {
     id: 'violet', label: '紫色',
@@ -30,6 +34,7 @@ export const ACCENTS = [
       400: '#a78bfa', 500: '#8b5cf6', 600: '#7c3aed', 700: '#6d28d9',
       rgb: '139, 92, 246',
     },
+    mood: { dark: '#121017', light: '#f7f5fc', glow: 'rgba(139,92,246,.07)' },
   },
   {
     id: 'orange', label: '橙色',
@@ -38,6 +43,7 @@ export const ACCENTS = [
       400: '#fb923c', 500: '#f97316', 600: '#ea580c', 700: '#c2410c',
       rgb: '249, 115, 22',
     },
+    mood: { dark: '#141210', light: '#fbf7f2', glow: 'rgba(249,115,22,.07)' },
   },
   {
     id: 'green', label: '绿色',
@@ -46,6 +52,7 @@ export const ACCENTS = [
       400: '#34d399', 500: '#10b981', 600: '#059669', 700: '#047857',
       rgb: '16, 185, 129',
     },
+    mood: { dark: '#0d1311', light: '#f2faf7', glow: 'rgba(16,185,129,.07)' },
   },
 ]
 
@@ -78,6 +85,36 @@ function apply() {
   const isLight = theme.value === 'light'
   root.style.setProperty('--tint', `rgba(${c.rgb}, ${isLight ? .10 : .14})`)
   root.style.setProperty('--tint-strong', `rgba(${c.rgb}, ${isLight ? .18 : .22})`)
+
+  // ---------- 氛围：随强调色改变页面底色与环境光 ----------
+  // 切换强调色不只是按钮换色，整个界面的底色调、侧栏色都跟着变，
+  // 视觉上的"换主题"感才明显。
+  const mood = a.mood || {}
+  const darkBase = mood.dark || '#0f1115'
+  const lightBase = mood.light || '#f4f6fa'
+  const darkRail = shade(darkBase, 6)   // 侧栏比页面更深一点
+  const lightRail = tint(lightBase, 4)
+  root.style.setProperty('--page-bg-dark', darkBase)
+  root.style.setProperty('--page-bg-light', lightBase)
+  root.style.setProperty('--rail-bg-dark', darkRail)
+  root.style.setProperty('--rail-bg-light', lightRail)
+  root.style.setProperty('--ambient-glow', mood.glow || 'transparent')
+}
+
+/* 颜色工具：把 hex 变暗 percent% */
+function shade(hex, percent) {
+  const n = parseInt(hex.slice(1), 16)
+  const f = (v) => Math.max(0, Math.min(255, Math.round(v * (100 - percent) / 100)))
+  const r = f((n >> 16) & 255), g = f((n >> 8) & 255), b = f(n & 255)
+  return `#${((r << 16) | (g << 8) | b).toString(16).padStart(6, '0')}`
+}
+
+/* 颜色工具：往白色靠 percent%（模拟提亮） */
+function tint(hex, percent) {
+  const n = parseInt(hex.slice(1), 16)
+  const f = (v) => Math.max(0, Math.min(255, Math.round(v + (255 - v) * percent / 100)))
+  const r = f((n >> 16) & 255), g = f((n >> 8) & 255), b = f(n & 255)
+  return `#${((r << 16) | (g << 8) | b).toString(16).padStart(6, '0')}`
 }
 
 export function setTheme(v) {

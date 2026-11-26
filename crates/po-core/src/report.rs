@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::library::Library;
-use crate::util::{human_size_i, iso_dt};
+use crate::util::human_size_i;
 
 /// CSV 导出的列（与 Python 版一致）
 pub const CSV_COLS: &[&str] = &[
@@ -38,6 +38,8 @@ pub const CSV_COLS: &[&str] = &[
     "dup_group",
     "is_best",
     "thumb",
+    "kind",
+    "duration",
 ];
 
 /// CSV 字段转义：含逗号、引号或换行时用双引号包裹，内部引号翻倍。
@@ -93,6 +95,8 @@ pub fn export_csv(lib: &Library, out_path: &Path) -> std::io::Result<usize> {
                 "dup_group" => r.dup_group.map(|v| v.to_string()).unwrap_or_default(),
                 "is_best" => r.is_best.map(|v| v.to_string()).unwrap_or_default(),
                 "thumb" => r.thumb.clone().unwrap_or_default(),
+                "kind" => r.kind.clone().unwrap_or_else(|| "photo".into()),
+                "duration" => r.duration.map(|v| format!("{v:.2}")).unwrap_or_default(),
                 _ => String::new(),
             };
             cells.push(csv_escape(&v));
@@ -127,6 +131,7 @@ h2{font-size:16px;margin:26px 0 10px;border-left:3px solid #7fd1c1;padding-left:
 .meta{padding:6px 8px;font-size:11px;color:#98a0ac;line-height:1.5}
 .meta b{color:#d6dae2;font-weight:500;display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .tag{display:inline-block;background:#26303a;color:#8fd4c6;border-radius:4px;padding:0 4px;margin:1px 2px 0 0;font-size:10px}
+.tag.vid{background:#3a2a26;color:#ffb088}
 table{border-collapse:collapse;width:100%;font-size:12px}
 td,th{border-bottom:1px solid #262b33;padding:6px 8px;text-align:left}
 th{color:#8b93a1;font-weight:500}
@@ -266,16 +271,23 @@ pub fn export_html(
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
+        // 视频额外标出时长
+        let dur_badge = match (r.is_video(), r.duration_text()) {
+            (true, Some(d)) => format!("<span class='tag vid'>▶ {}</span>", esc(&d)),
+            (true, None) => "<span class='tag vid'>▶ 视频</span>".to_string(),
+            _ => String::new(),
+        };
         let _ = write!(
             h,
             "<div class='item'><img loading='lazy' src='{}' alt=''>\
-             <div class='meta'><b>{}</b>{}<br>{}x{} · {}<br>{}</div></div>",
+             <div class='meta'><b>{}</b>{}<br>{}x{} · {} {}<br>{}</div></div>",
             esc(&src),
             esc(&name),
             esc(r.dt.as_deref().unwrap_or("无日期")),
             r.width.unwrap_or(0),
             r.height.unwrap_or(0),
             human_size_i(r.size.unwrap_or(0)),
+            dur_badge,
             tag_html
         );
     }
@@ -327,11 +339,6 @@ fn pathdiff(target: &Path, base: &Path) -> Option<std::path::PathBuf> {
         out.push(".");
     }
     Some(out)
-}
-
-/// 当前时间（供报告头部使用）
-pub fn now_string() -> String {
-    iso_dt(chrono::Local::now().naive_local())
 }
 
 #[cfg(test)]
@@ -483,11 +490,14 @@ mod tests {
     }
 
     #[test]
-    fn csv_columns_match_python() {
+    fn csv_columns_match_expected_order() {
         // 列顺序不能改，否则下游脚本会错位
         assert_eq!(CSV_COLS[0], "id");
         assert_eq!(CSV_COLS[1], "path");
-        assert_eq!(CSV_COLS.len(), 28);
+        assert_eq!(CSV_COLS.len(), 30);
         assert!(CSV_COLS.contains(&"p_hash") == false, "Python 版没导出 p_hash");
+        // 视频支持后新增的两列
+        assert!(CSV_COLS.contains(&"kind"));
+        assert!(CSV_COLS.contains(&"duration"));
     }
 }

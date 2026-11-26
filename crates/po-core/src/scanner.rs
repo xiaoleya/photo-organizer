@@ -12,8 +12,8 @@ use crate::config::{self, Settings};
 use crate::imaging;
 use crate::library::{now_ts, Library, PhotoUpdate};
 use crate::util::{
-    ext_dot_lower, from_unix_ts, is_image, iso_dt, parse_datetime, parse_datetime_from_path,
-    sha1_file, Precision,
+    ext_dot_lower, from_unix_ts, is_media, is_video, iso_dt, parse_datetime,
+    parse_datetime_from_path, sha1_file, Precision,
 };
 
 /// 遍历时跳过的目录名（小写比较）
@@ -58,7 +58,7 @@ pub fn walk_images(
                 if is_cancelled() {
                     return out;
                 }
-                if p.is_file() && is_image(&p) {
+                if p.is_file() && is_media(&p) {
                     out.push(p);
                 }
             }
@@ -105,7 +105,7 @@ pub fn walk_images(
                     continue;
                 }
                 subdirs.push(p);
-            } else if ft.is_file() && is_image(&p) {
+            } else if ft.is_file() && is_media(&p) {
                 out.push(p);
             }
         }
@@ -123,6 +123,7 @@ pub fn walk_images(
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ScanResult {
     pub added: usize,
+    pub updated: usize,
     pub skipped: usize,
     pub errors: usize,
     pub roots: usize,
@@ -151,6 +152,9 @@ pub fn scan_roots(
     for root in &roots_owned {
         lib.add_root(Path::new(root));
         let files = walk_images(Path::new(root), true, &[], cancel);
+        if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
+            break;
+        }
         for path in files {
             if cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
                 break;
@@ -177,7 +181,9 @@ pub fn scan_roots(
 
             if !force {
                 if let Some(row) = lib.photo_by_path(&key) {
-                    if (row.mtime.unwrap_or(0.0) - mtime).abs() < 1e-6 {
+                    if (row.mtime.unwrap_or(0.0) - mtime).abs() < 1e-6
+                        && row.size.unwrap_or(0) == meta.len() as i64
+                    {
                         res.skipped += 1;
                         continue;
                     }
@@ -193,12 +199,19 @@ pub fn scan_roots(
                 )
                 .int("size", Some(meta.len() as i64))
                 .real("mtime", Some(mtime))
-                .real("ctime", Some(ctime));
+                .real("ctime", Some(ctime))
+                .real("analyzed_at", None)
+                .text("thumb", None)
+                .text("kind", Some(if is_video(&path) { "video" } else { "photo" }));
+            let changed = lib.photo_by_path(&key).is_some();
             if lib.upsert_photo(&u).is_err() {
                 res.errors += 1;
                 continue;
             }
             res.added += 1;
+            if changed {
+                res.updated += 1;
+            }
 
             if let Some(p) = progress {
                 if res.added % 25 == 0 {
@@ -218,7 +231,7 @@ pub fn scan_roots(
     // 注意不要用 `if !seen.is_empty()` 做守卫：扫描一个空目录（或所有文件都已
     // 删除的目录）时 seen 为空，但那恰恰是最需要标记 missing 的情况。
     // 这里的判据是「文件系统上真的不在了」，见下面的 exists() 检查。
-    {
+    if !cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false) {
         let rows = lib.all_photos("missing=0", "id");
         for r in rows {
             if !seen.contains(&r.path) && !Path::new(&r.path).exists() {
@@ -235,6 +248,7 @@ struct Analyzed {
     id: i64,
     res: Option<imaging::Analysis>,
     err: Option<String>,
+    cancelled: bool,
 }
 
 /// 分析还没分析过的照片：EXIF、质量、哈希、缩略图。
@@ -294,6 +308,8 @@ pub fn analyze_pending(
             workers
         };
         pool = pool.num_threads(n.max(1));
+        // 视频走系统缩略图接口（COM 调用），默认 2MB 栈在多线程下偏紧
+        pool = pool.stack_size(8 * 1024 * 1024);
         let result = std::sync::Mutex::new(Vec::with_capacity(tasks.len()));
 
         let do_one = |(id, path, mtime): &(i64, String, f64)| -> Analyzed {
@@ -301,14 +317,20 @@ pub fn analyze_pending(
                 return Analyzed {
                     id: *id,
                     res: None,
-                    err: Some("cancelled".into()),
+                    err: None,
+                    cancelled: true,
                 };
             }
             let th = thumb_dir.join(format!(
                 "{}.jpg",
                 imaging::thumb_key(path, thumb_size, *mtime)
             ));
-            let out = imaging::analyze_photo(Path::new(path), &cfg_owned, Some(&th));
+            // 视频走系统缩略图接口，不能喂给图像解码器
+            let out = if is_video(Path::new(path)) {
+                analyze_video(Path::new(path), &th, thumb_size)
+            } else {
+                imaging::analyze_photo(Path::new(path), &cfg_owned, Some(&th))
+            };
             match out {
                 Some(mut a) => {
                     // 缩略图路径只在成功时记录
@@ -319,12 +341,14 @@ pub fn analyze_pending(
                         id: *id,
                         res: Some(a),
                         err: None,
+                        cancelled: false,
                     }
                 }
                 None => Analyzed {
                     id: *id,
                     res: None,
                     err: Some("decode failed".into()),
+                    cancelled: false,
                 },
             }
         };
@@ -369,6 +393,7 @@ pub fn analyze_pending(
                 update_from_analysis(lib, a.id, &res, cfg);
                 out.done += 1;
             }
+            None if a.cancelled => {}
             None => {
                 let msg = a.err.unwrap_or_default();
                 let _ = lib.set_meta("last_error", &format!("{}: {}", a.id, msg));
@@ -388,21 +413,49 @@ fn analyzed_parallel(
     total: usize,
     result: &std::sync::Mutex<Vec<Analyzed>>,
 ) {
-    tasks.par_iter().for_each(|t| {
+    let _ = tasks.par_iter().try_for_each(|t| {
         let a = do_one(t);
+        let cancelled = a.cancelled;
         let n = done_ctr.fetch_add(1, Ordering::Relaxed) + 1;
         if let Some(p) = progress {
             if n % 20 == 0 || n == total {
                 p("分析照片", n, total, "");
             }
         }
-        if a.res.is_none() {
+        if a.res.is_none() && !cancelled {
             fail_ctr.fetch_add(1, Ordering::Relaxed);
         }
         if let Ok(mut guard) = result.lock() {
             guard.push(a);
         }
+        if cancelled { Err(()) } else { Ok(()) }
     });
+}
+
+/// 分析一个视频。
+///
+/// 不做像素质量分析（对视频没意义），只用**系统缩略图接口**取一张封面图。
+/// 系统没装对应解码器时取不到，`thumb_ok` 为 false，前端显示占位图标。
+/// 无论有没有封面，都算「分析成功」——视频要能进图库、参与时间轴与归档。
+fn analyze_video(path: &Path, thumb_out: &Path, thumb_size: u32) -> Option<imaging::Analysis> {
+    let thumb_ok = crate::video::extract_frame(path, thumb_out, thumb_size);
+
+    Some(imaging::Analysis {
+        metrics: imaging::Metrics::default(),
+        a_hash: String::new(),
+        d_hash: String::new(),
+        p_hash: String::new(),
+        flags: Vec::new(),
+        screen_like: false,
+        has_people: false,
+        is_mono: false,
+        is_sepia: false,
+        age_score: 0.0,
+        quality_score: 0.0,
+        thumb_ok,
+        thumb_path: thumb_ok.then(|| thumb_out.to_string_lossy().to_string()),
+        duration: None,
+    })
 }
 
 /// 把分析结果写回库：时间、EXIF、质量指标、哈希、缩略图。
@@ -418,43 +471,55 @@ pub fn update_from_analysis(
     let path = row.path.clone();
     let path_ref = Path::new(&path);
 
-    // 时间：EXIF > 文件名 > 目录 > 文件修改时间
+    // 时间：手动修正优先，其次 EXIF > 文件名 > 目录 > 文件修改时间
+    let mut dt;
+    let mut src;
+    let mut prec;
     let ex = crate::exif::read_exif(path_ref);
-    let mut dt = ex.datetime;
-    let mut src = "exif";
-    let mut prec = Precision::Second;
 
-    if dt.is_none() {
-        let name = path_ref.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        let (d, p) = parse_datetime(name);
-        dt = d;
-        src = "filename";
-        if let Some(p) = p {
-            prec = p;
-        }
-    }
-    if dt.is_none() {
-        if let Some(dir) = path_ref.parent() {
-            let (d, p) = parse_datetime_from_path(dir);
+    if row.dt_source.as_deref() != Some("manual") {
+        dt = ex.datetime;
+        src = "exif";
+        prec = Precision::Second;
+
+        if dt.is_none() {
+            let name = path_ref.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            let (d, p) = parse_datetime(name);
             dt = d;
-            src = "folder";
+            src = "filename";
             if let Some(p) = p {
                 prec = p;
             }
         }
-    }
-    if dt.is_none() {
-        if let Some(d) = from_unix_ts(row.mtime.unwrap_or(0.0)) {
-            dt = Some(d);
-            src = "fs";
-            prec = Precision::Day;
+        if dt.is_none() {
+            if let Some(dir) = path_ref.parent() {
+                let (d, p) = parse_datetime_from_path(dir);
+                dt = d;
+                src = "folder";
+                if let Some(p) = p {
+                    prec = p;
+                }
+            }
         }
+        if dt.is_none() {
+            if let Some(d) = from_unix_ts(row.mtime.unwrap_or(0.0)) {
+                dt = Some(d);
+                src = "fs";
+                prec = Precision::Day;
+            }
+        }
+    } else {
+        dt = row.dt.as_deref().and_then(crate::util::parse_iso);
+        src = "manual";
+        prec = crate::util::Precision::from_str_opt(
+            row.dt_precision.as_deref().unwrap_or("year"),
+        )
+        .unwrap_or(crate::util::Precision::Year);
     }
 
     let m = &res.metrics;
     let mut u = PhotoUpdate::new(path.clone());
-    u.text("sha1", sha1_file(path_ref).ok().as_deref())
-        .int("width", Some(m.width as i64))
+    u.text("sha1", sha1_file(path_ref).ok().as_deref())        .int("width", Some(m.width as i64))
         .int("height", Some(m.height as i64))
         .real("megapixels", Some(m.megapixels))
         .real("aspect", Some(m.aspect))
@@ -483,14 +548,28 @@ pub fn update_from_analysis(
         .real("analyzed_at", Some(now_ts()))
         .int("missing", Some(0));
 
-    if let Some(d) = dt {
-        u.text("dt", Some(&iso_dt(d)))
-            .text("dt_source", Some(src))
-            .text("dt_precision", Some(prec.as_str()))
-            .int("year", Some(d.format("%Y").to_string().parse().unwrap_or(0)))
-            .int("month", Some(d.format("%m").to_string().parse().unwrap_or(0)))
-            .int("day", Some(d.format("%d").to_string().parse().unwrap_or(0)))
-            .int("hour", Some(d.format("%H").to_string().parse().unwrap_or(0)));
+    // 视频记时长；照片清空该列
+    if let Some(d) = res.duration {
+        u.real("duration", Some(d));
+    }
+    u.text(
+        "kind",
+        Some(if is_video(path_ref) { "video" } else { "photo" }),
+    );
+
+    // 手动修正优先：不重新推算日期
+    if row.dt_source.as_deref() != Some("manual") {
+        if let Some(d) = dt {
+            u.text("dt", Some(&iso_dt(d)))
+                .text("dt_source", Some(src))
+                .text("dt_precision", Some(prec.as_str()))
+                .int("year", Some(d.format("%Y").to_string().parse().unwrap_or(0)))
+                .int("month", Some(d.format("%m").to_string().parse().unwrap_or(0)))
+                .int("day", Some(d.format("%d").to_string().parse().unwrap_or(0)))
+                .int("hour", Some(d.format("%H").to_string().parse().unwrap_or(0)));
+        }
+    } else {
+        let _ = src;
     }
     if let Some(v) = ex.make.as_deref().filter(|s| !s.is_empty()) {
         u.text("camera_make", Some(v));
@@ -505,14 +584,16 @@ pub fn update_from_analysis(
         u.real("lat", ex.lat).real("lon", ex.lon);
     }
 
-    // 地点识别（常驻功能）
-    let hint = format!(
-        "{} {}",
-        path_ref.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
-        path_ref.file_name().and_then(|s| s.to_str()).unwrap_or("")
-    );
-    let place = crate::geo::resolve_place(ex.lat, ex.lon, &hint);
-    u.text("place", Some(&place));
+    // 地点识别（常驻功能）；手动修正优先
+    if row.place_source.as_deref() != Some("manual") {
+        let hint = format!(
+            "{} {}",
+            path_ref.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
+            path_ref.file_name().and_then(|s| s.to_str()).unwrap_or("")
+        );
+        let place = crate::geo::resolve_place(ex.lat, ex.lon, &hint);
+        u.text("place", Some(&place));
+    }
 
     let _ = cfg;
     let _ = lib.upsert_photo(&u);
@@ -612,6 +693,56 @@ mod tests {
         let r = scan_roots(&mut lib, &cfg, Some(&[dir.to_string_lossy().to_string()]), None, None, false);
         assert_eq!(r.added, 2, "{r:?}");
         assert_eq!(lib.count(""), 2);
+    }
+
+    #[test]
+    fn scan_changed_size_clears_analysis() {
+        let dir = work_dir("po_scan_changed_size");
+        let file = dir.join("a.jpg");
+        std::fs::copy(sample_dir().join("DSC_0071.JPG"), &file).unwrap();
+        let mut lib = Library::open_memory().unwrap();
+        let cfg = Settings::new();
+        let root = dir.to_string_lossy().to_string();
+        scan_roots(&mut lib, &cfg, Some(&[root.clone()]), None, None, false);
+        analyze_pending(&mut lib, &cfg, 0, None, None, 1, false);
+        let id = lib.all_photos("", "id")[0].id;
+        lib.set_favorite(id, true);
+        let mtime = lib.photo(id).unwrap().mtime;
+        let mut bytes = std::fs::read(&file).unwrap();
+        bytes.extend_from_slice(b"changed");
+        std::fs::write(&file, bytes).unwrap();
+        if let Some(mtime) = mtime {
+            let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs_f64(mtime);
+            std::fs::File::options().write(true).open(&file).unwrap()
+                .set_modified(modified).unwrap();
+        }
+
+        let r = scan_roots(&mut lib, &cfg, Some(&[root]), None, None, false);
+        let row = lib.photo(id).unwrap();
+        assert_eq!(r.added, 1);
+        assert_eq!(r.updated, 1);
+        assert_eq!(r.skipped, 0);
+        assert_eq!(row.analyzed_at, None);
+        assert_eq!(row.thumb, None);
+        assert_eq!(row.favorite, Some(1));
+    }
+
+    #[test]
+    fn cancelled_scan_does_not_mark_unseen_files_missing() {
+        let dir = work_dir("po_scan_cancel_missing");
+        std::fs::copy(sample_dir().join("DSC_0071.JPG"), dir.join("a.jpg")).unwrap();
+        let mut lib = Library::open_memory().unwrap();
+        let cfg = Settings::new();
+        let root = dir.to_string_lossy().to_string();
+        scan_roots(&mut lib, &cfg, Some(&[root.clone()]), None, None, false);
+        std::fs::remove_file(dir.join("a.jpg")).unwrap();
+        let cancel = new_test_cancel();
+        scan_roots(&mut lib, &cfg, Some(&[root]), None, Some(&cancel), false);
+        assert_eq!(lib.count("missing=1"), 0);
+    }
+
+    fn new_test_cancel() -> CancelFlag {
+        Arc::new(AtomicBool::new(true))
     }
 
     #[test]

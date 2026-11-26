@@ -34,12 +34,22 @@ async function invoke(cmd, args = {}) {
 
 async function startDrag(e) {
   if (e.button !== 0) return
+  // 双击要交给 dblclick 处理，否则两次 mousedown 都会调 start_dragging，
+  // 而 Tauri 在最大化状态下拖动会自动还原窗口 ——
+  // 表现就是"双击只会变小，不能变大"。
+  if (e.detail > 1) return
   await invoke('plugin:window|start_dragging')
 }
 
 async function minimize() { await invoke('plugin:window|minimize') }
 
 async function toggleMax() {
+  await invoke('plugin:window|toggle_maximize')
+  await refreshMax()
+}
+
+/* 双击标题栏切换最大化/还原 —— 两个方向都要生效 */
+async function onDblClick() {
   await invoke('plugin:window|toggle_maximize')
   await refreshMax()
 }
@@ -71,7 +81,8 @@ const analyzedPct = computed(() => {
 </script>
 
 <template>
-  <header class="titlebar" :class="{ maximized: maximizing }" @mousedown="startDrag">
+  <header class="titlebar" :class="{ maximized: maximizing }"
+          @mousedown="startDrag" @dblclick="onDblClick">
     <div class="tb-left">
       <span class="tb-title">照片整理-by小乐</span>
     </div>

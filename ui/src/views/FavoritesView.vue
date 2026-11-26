@@ -44,21 +44,23 @@ function onAnyFavorite(e) {
 </script>
 
 <template>
-  <div class="wrap">
-    <div class="head card">
-      <div class="head-left">
-        <div class="head-ico"><Icon name="starFilled" :size="20" /></div>
-        <div>
+  <div class="page">
+    <div class="page-head card">
+      <div class="page-head-main">
+        <div class="page-head-ico grad-amber">
+          <Icon name="starFilled" :size="20" />
+        </div>
+        <div class="page-head-text">
           <strong>{{ total }} 张收藏</strong>
           <span>在照片上点 ★ 即可加入或取消收藏</span>
         </div>
       </div>
     </div>
 
-    <div v-if="!total && !loading" class="empty card">
-      <Icon name="star" :size="30" />
-      <h3>还没有收藏的照片</h3>
-      <p>浏览照片时点卡片上的星标，就会收藏到这里</p>
+    <div v-if="!total && !loading" class="empty-state fill">
+      <div class="es-ico"><Icon name="star" :size="26" /></div>
+      <h3 class="es-title">还没有收藏的照片</h3>
+      <p class="es-desc">浏览照片时点卡片上的星标，就会收藏到这里</p>
     </div>
 
     <PhotosPanel
@@ -74,17 +76,5 @@ function onAnyFavorite(e) {
 </template>
 
 <style scoped>
-.wrap { height: 100%; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; padding-bottom: 24px; }
-.head { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 18px; flex: none; }
-.head-left { display: flex; align-items: center; gap: 12px; }
-.head-ico {
-  display: grid; place-items: center; width: 38px; height: 38px;
-  border-radius: var(--r-sm); color: #fff;
-  background: linear-gradient(135deg, #f5a623 0%, #f97316 100%);
-}
-.head-left strong { display: block; font-size: var(--fs-md); }
-.head-left span { font-size: var(--fs-xs); color: var(--text-tertiary); }
-.empty { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 60px 0; gap: 10px; color: var(--text-tertiary); }
-.empty h3 { margin: 0; color: var(--text-secondary); }
-.empty p { margin: 0; font-size: var(--fs-sm); }
+/* 布局已统一到 base.css 的 .page / .page-head / .empty-state，此处无自定义样式 */
 </style>

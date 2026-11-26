@@ -437,7 +437,12 @@ pub fn execute_organize(
 ) -> ExecuteResult {
     let dest_root = absolutize(dest_root);
     let _ = std::fs::create_dir_all(&dest_root);
-    let batch = format!("B{}", now_ts() as i64);
+    static BATCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let batch = format!(
+        "B{}-{}",
+        now_ts() as i64,
+        BATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     let total = plan.len();
     let mut out = ExecuteResult {
         total,
@@ -489,11 +494,17 @@ pub fn execute_organize(
                     true
                 }
                 Err(_) => match copy_file(&src, &target) {
-                    Ok(()) => {
-                        let _ = std::fs::remove_file(&src);
-                        out.moved += 1;
-                        true
-                    }
+                    Ok(()) => match std::fs::remove_file(&src) {
+                        Ok(()) => {
+                            out.moved += 1;
+                            true
+                        }
+                        Err(_) => {
+                            // 跨卷移动不能在源文件仍存在时记作成功，否则用户会丢定位。
+                            let _ = std::fs::remove_file(&target);
+                            false
+                        }
+                    },
                     Err(_) => false,
                 },
             },
@@ -513,6 +524,16 @@ pub fn execute_organize(
                 (Some(expected), Some(actual)) => expected == &actual,
                 _ => sha1_file(&target).is_ok(),
             };
+        }
+        if !verified {
+            // 校验失败的输出不可信；移动模式尽量把原文件放回去。
+            if mode == Mode::Move && !src.exists() {
+                let _ = std::fs::rename(&target, &src);
+            } else {
+                let _ = std::fs::remove_file(&target);
+            }
+            out.errors += 1;
+            continue;
         }
         let detail = format!(
             "batch={};mode={};sha1ok={};size={}",
@@ -564,33 +585,45 @@ fn hard_link_or_copy(src: &Path, dst: &Path) -> bool {
 pub struct RollbackResult {
     pub restored: usize,
     pub errors: usize,
+    pub skipped: usize,
+    pub messages: Vec<String>,
 }
 
 /// 撤销某批次（或最近未撤销）的整理操作。
 pub fn rollback(lib: &mut Library, batch: Option<&str>) -> RollbackResult {
-    let rows: Vec<(i64, String, String)> = match batch {
-        Some(b) if !b.is_empty() => lib.organize_ops_of_batch(b),
-        _ => {
-            // 找最近一批
-            match lib.latest_organize_batch() {
-                Some(b) => lib.organize_ops_of_batch(&b),
-                None => Vec::new(),
-            }
-        }
-    };
+    let rows = lib.organize_log_rows(batch, true);
 
     let mut out = RollbackResult::default();
-    for (id, src, dst) in rows {
+    for (id, src, dst, detail, _) in rows {
         let (src_p, dst_p) = (PathBuf::from(&src), PathBuf::from(&dst));
         if !dst_p.exists() {
+            if !src_p.exists() {
+                lib.repoint_photo_path(&dst, &src);
+            }
+            lib.mark_op_undone(id);
+            out.skipped += 1;
             continue;
         }
+        let src_hash = sha1_file(&src_p).ok();
+        let dst_hash = sha1_file(&dst_p).ok();
         if let Some(parent) = src_p.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        // 源位置还占着就先删目标，否则把目标移回源位置
+        // 源位置还占着：只有内容一致的副本才可删除，绝不覆盖已有文件
         let ok = if src_p.exists() {
-            std::fs::remove_file(&dst_p).is_ok()
+            if src_hash.is_some() && src_hash == dst_hash {
+                std::fs::remove_file(&dst_p).is_ok()
+            } else {
+                lib.mark_op_undone(id);
+                out.skipped += 1;
+                out.messages.push(format!("已保留内容不同的归档副本：{dst}"));
+                continue;
+            }
+        } else if detail.contains("mode=copy") {
+            lib.mark_op_undone(id);
+            out.skipped += 1;
+            out.messages.push(format!("原位置已变化，保留归档副本：{dst}"));
+            continue;
         } else {
             std::fs::rename(&dst_p, &src_p).is_ok()
                 || (copy_file(&dst_p, &src_p).is_ok()
@@ -947,6 +980,83 @@ mod tests {
         let r = execute_organize(&mut lib, &dest, &plan, Mode::Copy, Conflict::Rename, false, None, None);
         assert_eq!(r.errors, 1);
         assert_eq!(r.done, 0);
+    }
+
+    #[test]
+    fn rollback_is_idempotent_and_never_repeats() {
+        let src = work_dir("po_org_rb_twice_src");
+        std::fs::copy(sample_dir().join("DSC_0071.JPG"), src.join("a.jpg")).unwrap();
+        let dest = work_dir("po_org_rb_twice_dest");
+        let mut lib = Library::open_memory().unwrap();
+        let mut u = PhotoUpdate::new(src.join("a.jpg").to_string_lossy().to_string());
+        u.text("dt", Some("2000-01-01 00:00:00"))
+            .int("year", Some(2000))
+            .int("month", Some(1))
+            .text("ext", Some(".jpg"));
+        lib.upsert_photo(&u).unwrap();
+
+        let plan = plan_organize(&lib, &PlanOptions::default());
+        let r = execute_organize(&mut lib, &dest, &plan, Mode::Move, Conflict::Rename, true, None, None);
+        let first = rollback(&mut lib, Some(&r.batch));
+        assert_eq!(first.restored, 1);
+
+        // 再次撤销同一批次：不能重复统计，也不能产生副作用
+        let second = rollback(&mut lib, Some(&r.batch));
+        assert_eq!(second.restored, 0, "{second:?}");
+        assert_eq!(second.skipped, 0);
+        assert_eq!(second.errors, 0);
+        assert!(src.join("a.jpg").exists());
+    }
+
+    #[test]
+    fn rollback_keeps_modified_copy() {
+        let src = work_dir("po_org_rb_mod_src");
+        std::fs::copy(sample_dir().join("DSC_0071.JPG"), src.join("a.jpg")).unwrap();
+        let dest = work_dir("po_org_rb_mod_dest");
+        let mut lib = Library::open_memory().unwrap();
+        let mut u = PhotoUpdate::new(src.join("a.jpg").to_string_lossy().to_string());
+        u.text("dt", Some("2000-01-01 00:00:00"))
+            .int("year", Some(2000))
+            .int("month", Some(1))
+            .text("ext", Some(".jpg"));
+        lib.upsert_photo(&u).unwrap();
+        let plan = plan_organize(&lib, &PlanOptions::default());
+        let r = execute_organize(&mut lib, &dest, &plan, Mode::Copy, Conflict::Rename, true, None, None);
+
+        // 用户在归档目录里改过副本：撤销时不能删掉用户的工作
+        let copied = PathBuf::from(
+            &lib.organize_log_rows(Some(&r.batch), true)
+                .first()
+                .expect("应有归档日志")
+                .2,
+        );
+        std::fs::write(&copied, b"user edited this file").unwrap();
+        let rb = rollback(&mut lib, Some(&r.batch));
+        assert_eq!(rb.restored, 0, "{rb:?}");
+        assert_eq!(rb.skipped, 1);
+        assert!(copied.exists(), "内容不同的副本必须保留");
+        assert_eq!(
+            std::fs::read(&copied).unwrap(),
+            b"user edited this file".to_vec()
+        );
+    }
+
+    #[test]
+    fn batch_ids_are_unique_within_same_second() {
+        let src = work_dir("po_org_batch_src");
+        std::fs::copy(sample_dir().join("DSC_0071.JPG"), src.join("a.jpg")).unwrap();
+        let dest = work_dir("po_org_batch_dest");
+        let mut lib = Library::open_memory().unwrap();
+        let mut u = PhotoUpdate::new(src.join("a.jpg").to_string_lossy().to_string());
+        u.text("dt", Some("2000-01-01 00:00:00"))
+            .int("year", Some(2000))
+            .int("month", Some(1))
+            .text("ext", Some(".jpg"));
+        lib.upsert_photo(&u).unwrap();
+        let plan = plan_organize(&lib, &PlanOptions::default());
+        let a = execute_organize(&mut lib, &dest, &plan, Mode::Copy, Conflict::Rename, true, None, None);
+        let b = execute_organize(&mut lib, &dest, &plan, Mode::Copy, Conflict::Rename, true, None, None);
+        assert_ne!(a.batch, b.batch, "同秒两批也不能撞批次号");
     }
 
     #[test]

@@ -5,7 +5,8 @@ use po_core::config::Settings;
 
 fn main() {
     let cfg = Settings::new();
-    let base = std::path::Path::new("E:/agent xm/照片整理-GitHub发布/源码/samples");
+    // 相对路径：从源码根目录运行 `cargo run --bin po-diag`
+    let base = std::path::Path::new("samples");
     let names = [
         "1985-06-12 春节全家福.jpg",
         "1985年06月12日 老家院子合影.jpg",
@@ -15,7 +16,6 @@ fn main() {
         "扫描件_2008-07-20_证件照.jpg",
         "微信图片_20200101.jpg",
         "DSC_0071.JPG",
-        "模糊的老照片 1978.jpg",
     ];
     println!("{:<30} {:>7} {:>7} {:>7} {:>7} {:>7} {:>6} {:>6}  flags", "文件", "blur", "contrast", "noise", "sepia", "color", "sharp", "thresh");
     for n in names {

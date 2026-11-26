@@ -2529,7 +2529,7 @@ dependencies = [
 
 [[package]]
 name = "photo-organizer"
-version = "1.1.0"
+version = "2.1.0"
 dependencies = [
  "image",
  "po-core",
@@ -2582,7 +2582,7 @@ dependencies = [
 
 [[package]]
 name = "po-core"
-version = "1.0.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2596,6 +2596,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "thiserror 2.0.21",
+ "windows 0.58.0",
 ]
 
 [[package]]

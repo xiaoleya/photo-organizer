@@ -86,22 +86,24 @@ function isYearOpen(place, year) {
 </script>
 
 <template>
-  <div class="wrap">
-    <div class="head card">
-      <div class="head-left">
-        <div class="head-ico"><Icon name="mapPin" :size="20" /></div>
-        <div>
+  <div class="page">
+    <div class="page-head card">
+      <div class="page-head-main">
+        <div class="page-head-ico grad-blue"><Icon name="mapPin" :size="20" /></div>
+        <div class="page-head-text">
           <strong>{{ knownCount }} 个已识别地点</strong>
           <span>共 {{ totalPhotos }} 张照片<template v-if="places.length > knownCount">，另有 {{ places.length - knownCount }} 组未识别</template></span>
         </div>
       </div>
-      <label class="head-search">
-        <Icon name="search" :size="16" />
-        <input v-model="keyword" placeholder="按地点名筛选" />
-      </label>
-      <button class="head-btn" :disabled="backfilling" @click="backfill">
-        {{ backfilling ? '识别中…' : '重新识别地点' }}
-      </button>
+      <div class="page-head-acts">
+        <label class="head-search">
+          <Icon name="search" :size="16" />
+          <input v-model="keyword" placeholder="按地点名筛选" />
+        </label>
+        <button class="btn btn-ghost" :disabled="backfilling" @click="backfill">
+          {{ backfilling ? '识别中…' : '重新识别地点' }}
+        </button>
+      </div>
     </div>
 
     <!-- 地点识别说明：很多用户不知道哪些照片才有地点 -->
@@ -131,10 +133,10 @@ function isYearOpen(place, year) {
       </div>
     </details>
 
-    <div v-if="!places.length && !loading" class="empty">
-      <Icon name="mapPin" :size="30" />
-      <h3>还没有地点信息</h3>
-      <p>带 GPS 的照片会自动识别到城市；目录名里带城市名也能识别</p>
+    <div v-if="!places.length && !loading" class="empty-state fill">
+      <div class="es-ico"><Icon name="mapPin" :size="26" /></div>
+      <h3 class="es-title">还没有地点信息</h3>
+      <p class="es-desc">带 GPS 的照片会自动识别到城市；目录名里带城市名也能识别</p>
     </div>
 
     <div v-else class="places">
@@ -186,20 +188,9 @@ function isYearOpen(place, year) {
 </template>
 
 <style scoped>
-.wrap { height: 100%; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; padding-bottom: 24px; }
-.head { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 18px; flex: none; }
-.head-left { display: flex; align-items: center; gap: 12px; }
-.head-ico { display: grid; place-items: center; width: 38px; height: 38px; border-radius: var(--r-sm); background: var(--grad-blue); color: #fff; }
-.head-left strong { display: block; font-size: var(--fs-md); }
-.head-left span { font-size: var(--fs-xs); color: var(--text-tertiary); }
+/* 根容器/页头/空态已统一到 base.css，这里只保留本页特有的地点树样式 */
 .head-search { display: flex; align-items: center; gap: 8px; height: 34px; padding: 0 12px; border-radius: var(--r-pill); background: var(--surface-2); color: var(--text-tertiary); }
 .head-search input { width: 180px; font-size: var(--fs-sm); color: var(--text-primary); }
-.head-btn {
-  flex: none; padding: 8px 14px; border-radius: var(--r-pill);
-  background: var(--surface-2); color: var(--text-secondary); font-size: var(--fs-sm);
-}
-.head-btn:hover { background: var(--surface-3); color: var(--text-primary); }
-.head-btn:disabled { opacity: .6; }
 
 /* 地点识别说明 */
 .notice {
@@ -223,9 +214,6 @@ function isYearOpen(place, year) {
   background: var(--surface-2); font-size: var(--fs-xs);
 }
 .notice-tip { color: var(--text-tertiary); font-size: var(--fs-xs); margin-top: 10px !important; }
-.empty { display: flex; flex-direction: column; align-items: center; justify-content: center; flex: 1; gap: 10px; color: var(--text-tertiary); }
-.empty h3 { margin: 0; color: var(--text-secondary); }
-.empty p { margin: 0; font-size: var(--fs-sm); }
 .places { display: flex; flex-direction: column; gap: 14px; }
 .region { display: flex; flex-direction: column; gap: 10px; }
 .region-head {

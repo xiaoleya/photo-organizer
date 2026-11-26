@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!--
+    照片整理 App 图标 · 无背景的蓝色相机
+
+    设计要点：
+      · 不要背底板：任务栏是深色时，深色底会把图标糊成一个圆点，
+        去掉后背底由系统提供，图标在任何主题下都干净
+      · 相机整体半透明（约 .88），边缘自然融入任务栏
+      · 镜头白环加粗，保证缩到 16px 时仍能分辨（原来 26px 缩到 16px 只剩不到 1 像素，会消失）
+  -->
+  <defs>
+    <linearGradient id="body" x1="0.5" y1="0" x2="0.5" y2="1">
+      <stop offset="0" stop-color="#5EB2FF"/>
+      <stop offset="1" stop-color="#2E7FDC"/>
+    </linearGradient>
+
+    <radialGradient id="lens" cx=".38" cy=".35" r=".9">
+      <stop offset="0" stop-color="#4A9CF0"/>
+      <stop offset="1" stop-color="#1E5FB4"/>
+    </radialGradient>
+
+    <filter id="soft" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#0E3A78" flood-opacity=".22"/>
+    </filter>
+  </defs>
+
+  <!-- 相机整体半透明：透出任务栏底色 -->
+  <g opacity="0.88" filter="url(#soft)">
+    <!-- 顶部取景器凸起（在机身后面，先画） -->
+    <rect x="372" y="212" width="280" height="150" rx="54" fill="url(#body)"/>
+
+    <!-- 机身 -->
+    <rect x="112" y="300" width="800" height="512" rx="132" fill="url(#body)"/>
+
+    <!-- 镜头白环：加粗到 40，缩小后仍能看清 -->
+    <circle cx="512" cy="556" r="152" fill="none" stroke="#ffffff" stroke-width="40"/>
+
+    <!-- 镜头内芯 -->
+    <circle cx="512" cy="556" r="96" fill="url(#lens)"/>
+
+    <!-- 镜头高光 -->
+    <circle cx="470" cy="514" r="28" fill="#ffffff" opacity=".55"/>
+
+    <!-- 闪光灯小点 -->
+    <circle cx="788" cy="392" r="24" fill="#ffffff" opacity=".42"/>
+  </g>
+</svg>

@@ -104,7 +104,25 @@ watch(active, () => {})
 </script>
 
 <template>
-  <div class="wrap">
+  <div class="page">
+    <div class="page-head card">
+      <div class="page-head-main">
+        <div class="page-head-ico grad-amber"><Icon name="quality" :size="20" /></div>
+        <div class="page-head-text">
+          <strong>质量待修</strong>
+          <span>按统计特征判定模糊、过暗、褪色、泛黄、噪点，可调标准</span>
+        </div>
+      </div>
+      <div class="page-head-acts">
+        <button class="btn btn-ghost" :disabled="rescanning" @click="reclassify">
+          {{ rescanning ? '重新判定中…' : '按新标准重新判定' }}
+        </button>
+        <button class="btn btn-ghost" @click="showStandard = !showStandard">
+          {{ showStandard ? '收起识别标准' : '识别标准' }}
+        </button>
+      </div>
+    </div>
+
     <div class="flags">
       <button
         v-for="f in FLAGS" :key="f.id" class="flag"
@@ -122,12 +140,6 @@ watch(active, () => {})
 
     <div class="bar">
       <span>{{ active }} · {{ activeInfo.desc }}</span>
-      <button class="rescan" :disabled="rescanning" @click="reclassify">
-        {{ rescanning ? '重新判定中…' : '按新标准重新判定' }}
-      </button>
-      <button class="rescan" @click="showStandard = !showStandard">
-        {{ showStandard ? '收起识别标准' : '识别标准' }}
-      </button>
     </div>
 
     <!-- 识别标准（原在设置页，挪到这里更贴近使用场景） -->
@@ -169,7 +181,7 @@ watch(active, () => {})
 </template>
 
 <style scoped>
-.wrap { height: 100%; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; padding-bottom: 24px; }
+/* 根容器/页头已统一到 base.css，这里保留质量分类卡与识别标准面板的样式 */
 .flags { display: flex; gap: 10px; flex-wrap: wrap; flex: none; }
 .flag {
   display: flex; align-items: center; gap: 10px;
@@ -180,20 +192,11 @@ watch(active, () => {})
 .flag:hover { transform: translateY(-2px); }
 .flag.on { box-shadow: var(--shadow-md), 0 0 0 2px var(--tint-strong); }
 .fico { display: grid; place-items: center; width: 30px; height: 30px; border-radius: var(--r-xs); color: #fff; }
-.grad-blue { background: var(--grad-blue) } .grad-violet { background: var(--grad-violet) }
-.grad-pink { background: var(--grad-pink) } .grad-amber { background: var(--grad-amber) }
-.grad-green { background: var(--grad-green) }
 .ftext { display: flex; flex-direction: column; gap: 1px; }
 .fname { font-size: var(--fs-sm); font-weight: 600; }
 .fdesc { font-size: 10px; color: var(--text-tertiary); }
 .fnum { font-size: var(--fs-sm); color: var(--text-tertiary); margin-left: 4px; }
 .bar { flex: none; display: flex; align-items: center; gap: 12px; font-size: var(--fs-sm); color: var(--text-tertiary); }
-.rescan {
-  margin-left: auto; padding: 6px 14px; border-radius: var(--r-pill);
-  background: var(--surface-2); color: var(--text-secondary); font-size: var(--fs-xs);
-}
-.rescan:hover { background: var(--surface-3); color: var(--text-primary); }
-.rescan:disabled { opacity: .6; }
 
 /* 识别标准面板 */
 .standard { flex: none; padding: 15px 18px; margin-bottom: 2px; }

@@ -81,7 +81,9 @@
 [data-theme='dark'] {
   color-scheme: dark;
 
-  --page-bg:      #0f1115;
+  /* 页面底色随强调色联动（theme.js 动态覆盖 --page-bg-dark） */
+  --page-bg:      var(--page-bg-dark, #0f1115);
+  --rail-bg:      var(--rail-bg-dark, #0f1115);
   --surface:      #191c22;
   --surface-2:    #21252d;
   --surface-3:    #2a2f38;
@@ -103,6 +105,19 @@
 
   --tint: rgba(59,149,247,.14);
   --tint-strong: rgba(59,149,247,.22);
+
+  /* ---------- 质感层：让表面有"隆起"感而非纯色块 ----------
+     用户反馈底部阴影边太重，这里整体调轻 */
+  --sheen-top: inset 0 1px 0 rgba(255,255,255,.04);
+  --sheen-bottom: inset 0 -1px 0 rgba(0,0,0,.14);
+  --surface-shadow: var(--sheen-top), var(--sheen-bottom), var(--shadow-soft);
+  --surface-shadow-hover: var(--sheen-top), var(--sheen-bottom),
+                          0 8px 22px rgba(0,0,0,.38), 0 2px 5px rgba(0,0,0,.25);
+  --surface-stroke: rgba(255,255,255,.05);
+  --surface-stroke-hover: rgba(255,255,255,.09);
+  --inset-sunken: inset 0 1px 3px rgba(0,0,0,.25);
+  /* 柔和版投影：比 shadow-md 轻一档，用于卡片日常状态 */
+  --shadow-soft: 0 3px 10px rgba(0,0,0,.30);
 }
 
 /* ==========================================================================
@@ -111,7 +126,8 @@
 [data-theme='light'] {
   color-scheme: light;
 
-  --page-bg:      #f4f6fa;
+  --page-bg:      var(--page-bg-light, #f4f6fa);
+  --rail-bg:      var(--rail-bg-light, #f4f6fa);
   --surface:      #ffffff;
   --surface-2:    #f7f9fc;
   --surface-3:    #eef2f8;
@@ -132,4 +148,15 @@
 
   --tint: rgba(59,149,247,.10);
   --tint-strong: rgba(59,149,247,.18);
+
+  /* 浅色下高光弱一些，阴影更柔 */
+  --sheen-top: inset 0 1px 0 rgba(255,255,255,.85);
+  --sheen-bottom: inset 0 -1px 0 rgba(16,24,40,.025);
+  --surface-shadow: var(--sheen-top), var(--sheen-bottom), var(--shadow-soft);
+  --surface-shadow-hover: var(--sheen-top), var(--sheen-bottom),
+                          0 8px 22px rgba(16,24,40,.10), 0 2px 5px rgba(16,24,40,.06);
+  --surface-stroke: rgba(16,24,40,.05);
+  --surface-stroke-hover: rgba(16,24,40,.09);
+  --inset-sunken: inset 0 1px 3px rgba(16,24,40,.06);
+  --shadow-soft: 0 3px 10px rgba(16,24,40,.06);
 }

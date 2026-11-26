@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::config;
+use crate::util::unique_path;
 /// 建表语句。列名、类型、索引名都必须与原版保持完全一致。
 pub const SCHEMA: &str = r#"
 PRAGMA journal_mode=WAL;
@@ -27,7 +28,7 @@ CREATE TABLE IF NOT EXISTS photos (
     dt_precision TEXT,
     year INTEGER, month INTEGER, day INTEGER, hour INTEGER,
     camera_make TEXT, camera_model TEXT, software TEXT,
-    lat REAL, lon REAL, place TEXT,
+    lat REAL, lon REAL, place TEXT, place_source TEXT,
     blur REAL, brightness REAL, contrast REAL, saturation REAL,
     hue REAL, sepia REAL, color REAL, skin REAL, noise REAL, sharpness REAL,
     dark_ratio REAL, white_ratio REAL,
@@ -36,7 +37,10 @@ CREATE TABLE IF NOT EXISTS photos (
     age_score REAL, quality_score REAL,
     thumb TEXT, analyzed_at REAL, missing INTEGER DEFAULT 0,
     dup_group INTEGER, is_best INTEGER DEFAULT 0, note TEXT,
-    favorite INTEGER DEFAULT 0
+    favorite INTEGER DEFAULT 0,
+    -- photo / video。视频只做抽帧与时长，不做像素质量分析
+    kind TEXT DEFAULT 'photo',
+    duration REAL
 );
 CREATE INDEX IF NOT EXISTS idx_photos_dt ON photos(dt);
 CREATE INDEX IF NOT EXISTS idx_photos_folder ON photos(folder);
@@ -77,6 +81,13 @@ CREATE TABLE IF NOT EXISTS events (
     cover_id INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS event_members (
+    event_id INTEGER NOT NULL,
+    photo_id INTEGER NOT NULL UNIQUE,
+    PRIMARY KEY (event_id, photo_id)
+);
+CREATE INDEX IF NOT EXISTS idx_em_photo ON event_members(photo_id);
+
 CREATE TABLE IF NOT EXISTS dup_groups (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     kind TEXT DEFAULT 'similar',  -- exact / similar
@@ -97,6 +108,7 @@ CREATE TABLE IF NOT EXISTS ops_log (
 );
 
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+
 "#;
 
 /// 可写入 photos 表的列（不含自增主键）。
@@ -126,6 +138,7 @@ pub const PHOTO_COLS: &[&str] = &[
     "lat",
     "lon",
     "place",
+    "place_source",
     "blur",
     "brightness",
     "contrast",
@@ -154,6 +167,8 @@ pub const PHOTO_COLS: &[&str] = &[
     "is_best",
     "note",
     "favorite",
+    "kind",
+    "duration",
 ];
 
 /// 照片行的通用读取：按列名取值，缺失列返回空，便于兼容旧库。
@@ -185,6 +200,7 @@ pub struct PhotoRow {
     pub lat: Option<f64>,
     pub lon: Option<f64>,
     pub place: Option<String>,
+    pub place_source: Option<String>,
     pub blur: Option<f64>,
     pub brightness: Option<f64>,
     pub contrast: Option<f64>,
@@ -213,6 +229,10 @@ pub struct PhotoRow {
     pub is_best: Option<i64>,
     pub note: Option<String>,
     pub favorite: Option<i64>,
+    /// `photo` 或 `video`
+    pub kind: Option<String>,
+    /// 视频时长（秒），照片为 NULL
+    pub duration: Option<f64>,
 }
 
 impl PhotoRow {
@@ -244,6 +264,7 @@ impl PhotoRow {
             lat: row.get("lat").ok(),
             lon: row.get("lon").ok(),
             place: row.get("place").ok(),
+            place_source: row.get("place_source").ok(),
             blur: row.get("blur").ok(),
             brightness: row.get("brightness").ok(),
             contrast: row.get("contrast").ok(),
@@ -272,11 +293,32 @@ impl PhotoRow {
             is_best: row.get("is_best").ok(),
             note: row.get("note").ok(),
             favorite: row.get("favorite").ok(),
+            kind: row.get("kind").ok(),
+            duration: row.get("duration").ok(),
         })
     }
 
     pub fn is_favorite(&self) -> bool {
         self.favorite.unwrap_or(0) != 0
+    }
+
+    pub fn is_video(&self) -> bool {
+        self.kind.as_deref() == Some("video")
+    }
+
+    /// 视频时长的人类可读形式，如 `1:23`
+    pub fn duration_text(&self) -> Option<String> {
+        let d = self.duration?;
+        if d <= 0.0 || !d.is_finite() {
+            return None;
+        }
+        let total = d.round() as i64;
+        let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+        Some(if h > 0 {
+            format!("{h}:{m:02}:{s:02}")
+        } else {
+            format!("{m}:{s:02}")
+        })
     }
 
     pub fn is_missing(&self) -> bool {
@@ -376,9 +418,31 @@ impl Library {
                 .conn
                 .execute("ALTER TABLE photos ADD COLUMN place TEXT", []);
         }
+        // 视频支持：老库没有 kind / duration 列
+        if !cols.contains(&"kind".to_string()) {
+            let _ = self.conn.execute(
+                "ALTER TABLE photos ADD COLUMN kind TEXT DEFAULT 'photo'",
+                [],
+            );
+        }
+        if !cols.contains(&"duration".to_string()) {
+            let _ = self
+                .conn
+                .execute("ALTER TABLE photos ADD COLUMN duration REAL", []);
+        }
+        if !cols.contains(&"place_source".to_string()) {
+            let _ = self.conn.execute(
+                "ALTER TABLE photos ADD COLUMN place_source TEXT",
+                [],
+            );
+        }
         // 索引必须在列存在之后再建
         let _ = self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_photos_fav ON photos(favorite)",
+            [],
+        );
+        let _ = self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_photos_kind ON photos(kind)",
             [],
         );
     }
@@ -401,9 +465,6 @@ impl Library {
         &self.conn
     }
 
-    pub fn conn_mut(&mut self) -> &mut Connection {
-        &mut self.conn
-    }
 
     /// 取单行（任意查询，返回第一列）
     pub fn query_count(&self, sql: &str, args: &[&dyn rusqlite::ToSql]) -> i64 {
@@ -457,13 +518,6 @@ impl Library {
         it.flatten().collect()
     }
 
-    pub fn touch_root(&self, path: &Path) {
-        let abs = absolutize(path);
-        let _ = self.conn.execute(
-            "UPDATE roots SET last_scan=? WHERE path=?",
-            params![now_ts(), abs],
-        );
-    }
 
     // -------------------------------------------------------------- 照片
 
@@ -576,6 +630,9 @@ impl Library {
     }
 
     pub fn delete_photo(&self, id: i64) {
+        let _ = self
+            .conn
+            .execute("DELETE FROM event_members WHERE photo_id=?", params![id]);
         let _ = self
             .conn
             .execute("DELETE FROM photo_tags WHERE photo_id=?", params![id]);
@@ -758,6 +815,7 @@ impl Library {
 
     /// 清空事件表及相关标签（重建聚类前调用）。
     pub fn clear_events(&self) {
+        let _ = self.conn.execute("DELETE FROM event_members", []);
         let _ = self.conn.execute("DELETE FROM events", []);
         let _ = self.conn.execute(
             "DELETE FROM photo_tags WHERE source IN ('event','time')",
@@ -788,6 +846,21 @@ impl Library {
         );
         self.conn.last_insert_rowid()
     }
+
+    pub fn add_event_members(&self, event_id: i64, photo_ids: &[i64]) {
+        let Ok(tx) = self.conn.unchecked_transaction() else {
+            return;
+        };
+        for pid in photo_ids {
+            let _ = tx.execute(
+                "INSERT OR REPLACE INTO event_members(event_id,photo_id) VALUES(?,?)",
+                params![event_id, pid],
+            );
+        }
+        let _ = tx.commit();
+    }
+
+    // -------------------------------------------------------------- 相册
 
     // -------------------------------------------------------------- 重复组
 
@@ -872,53 +945,7 @@ impl Library {
         it.flatten().collect()
     }
 
-    /// 找出某批次（按 `detail` 里的 `batch=` 前缀）的整理记录，倒序。
-    pub fn organize_ops_of_batch(&self, batch: &str) -> Vec<(i64, String, String)> {
-        let pattern = format!("%{batch}%");
-        let Ok(mut stmt) = self.conn.prepare(
-            "SELECT id, src, dst FROM ops_log \
-             WHERE kind='organize' AND undone=0 AND detail LIKE ? ORDER BY id DESC",
-        ) else {
-            return Vec::new();
-        };
-        let Ok(it) = stmt.query_map(params![pattern], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-            ))
-        }) else {
-            return Vec::new();
-        };
-        it.flatten().collect()
-    }
 
-    /// 最近一个未撤销的整理批次号。
-    pub fn latest_organize_batch(&self) -> Option<String> {
-        // query_row 取的是 Option<String>（列可能为 NULL），
-        // optional() 再包一层表示「行是否存在」，所以要 flatten 两次。
-        let detail: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT detail FROM ops_log WHERE kind='organize' AND undone=0 \
-                 ORDER BY id DESC LIMIT 1",
-                [],
-                |r| r.get::<_, Option<String>>(0),
-            )
-            .optional()
-            .ok()
-            .flatten()
-            .flatten();
-        let d = detail?;
-        // detail 形如 batch=B1700000000;mode=copy;...
-        let after = d.split("batch=").nth(1)?;
-        let batch = after.split(';').next()?.trim();
-        if batch.is_empty() {
-            None
-        } else {
-            Some(batch.to_string())
-        }
-    }
 
     /// 把一张照片的 path 从 `from` 改成 `to`（回滚用）。
     pub fn repoint_photo_path(&self, from: &str, to: &str) {
@@ -936,6 +963,77 @@ impl Library {
         let _ = self
             .conn
             .execute("UPDATE photos SET name=? WHERE id=?", params![name, id]);
+    }
+
+    /// 重生成视频封面后写回缩略图路径。
+    pub fn set_video_thumb(&self, id: i64, thumb: &str) {
+        let _ = self.conn.execute(
+            "UPDATE photos SET thumb=? WHERE id=?",
+            params![thumb, id],
+        );
+    }
+
+    /// 手动修正日期。`source` 为 None 表示清空手动值，恢复自动识别。
+    pub fn set_manual_date(
+        &self,
+        id: i64,
+        date: Option<&str>,
+        precision: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        let Some(d) = date.and_then(crate::util::parse_iso) else {
+            return self
+                .conn
+                .execute("UPDATE photos SET dt_source=NULL WHERE id=?", params![id])
+                .map(|_| ());
+        };
+        let prec = crate::util::Precision::from_str_opt(precision.unwrap_or("day"))
+            .unwrap_or(crate::util::Precision::Day);
+        self.conn.execute(
+            "UPDATE photos SET dt=?, dt_source='manual', dt_precision=?, \
+             year=?, month=?, day=?, hour=? WHERE id=?",
+            params![
+                crate::util::iso_dt(d),
+                prec.as_str(),
+                d.format("%Y").to_string().parse::<i64>().unwrap_or(0),
+                d.format("%m").to_string().parse::<i64>().unwrap_or(0),
+                d.format("%d").to_string().parse::<i64>().unwrap_or(0),
+                d.format("%H").to_string().parse::<i64>().unwrap_or(0),
+                id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 手动修正地点。`place` 为 None/空表示清空手动值，恢复自动识别。
+    pub fn set_manual_place(&self, id: i64, place: Option<&str>) -> rusqlite::Result<()> {
+        let cleaned = place.map(|s| s.trim()).filter(|s| !s.is_empty());
+        let Some(p) = cleaned else {
+            return self
+                .conn
+                .execute("UPDATE photos SET place_source=NULL WHERE id=?", params![id])
+                .map(|_| ());
+        };
+        self.conn.execute(
+            "UPDATE photos SET place=?, place_source='manual' WHERE id=?",
+            params![p, id],
+        )?;
+        Ok(())
+    }
+
+    /// 手动设置备注。空串表示清除。
+    pub fn set_note(&self, id: i64, note: Option<&str>) -> rusqlite::Result<()> {
+        let cleaned = note.map(|s| s.trim()).filter(|s| !s.is_empty());
+        match cleaned {
+            Some(s) => self.conn.execute(
+                "UPDATE photos SET note=? WHERE id=?",
+                params![s, id],
+            ),
+            None => self.conn.execute(
+                "UPDATE photos SET note=NULL WHERE id=?",
+                params![id],
+            ),
+        }?;
+        Ok(())
     }
 
     /// 标记某条操作日志为已撤销。
@@ -1136,6 +1234,7 @@ impl Library {
     /// 清空索引（保留或清空根目录列表），并清空缩略图缓存目录。
     pub fn reset_index(&self, keep_roots: bool) {
         let _ = self.conn.execute("DELETE FROM photo_tags", []);
+        let _ = self.conn.execute("DELETE FROM event_members", []);
         let _ = self.conn.execute("DELETE FROM events", []);
         let _ = self.conn.execute("DELETE FROM dup_groups", []);
         let _ = self.conn.execute("DELETE FROM photos", []);
@@ -1263,15 +1362,105 @@ impl Library {
         stats
     }
 
-    /// 按 id 删除照片（移到回收目录或直接删除）。
+    /// 给定待删 id，返回其中会被"整组删光"拦下的照片。
+    ///
+    /// 规则：同一 dup_group 里，删除后仍在库中的照片至少留 1 张；
+    /// 不属于重复组的照片不受影响。
+    pub fn blocked_by_dup_guard(&self, ids: &[i64]) -> Vec<i64> {
+        use std::collections::{HashMap, HashSet};
+        let deleting: HashSet<i64> = ids.iter().copied().collect();
+        let mut by_group: HashMap<i64, Vec<i64>> = HashMap::new();
+        for id in ids {
+            let Some(r) = self.photo(*id) else { continue };
+            let Some(gid) = r.dup_group else { continue };
+            by_group.entry(gid).or_default().push(*id);
+        }
+        let mut blocked = Vec::new();
+        for (gid, picked) in by_group {
+            let survivors: Vec<i64> = self
+                .photo_ids(&format!("dup_group={gid} AND missing=0"))
+                .into_iter()
+                .filter(|id| !deleting.contains(id))
+                .collect();
+            if !survivors.is_empty() {
+                continue;
+            }
+            // 整组都会被删：保下"最佳"那张，没有标记就保列表里第一张
+            let best = picked.iter().copied().find(|id| {
+                self.photo(*id)
+                    .map(|r| r.is_best.unwrap_or(0) != 0)
+                    .unwrap_or(false)
+            });
+            if let Some(id) = best.or_else(|| picked.first().copied()) {
+                blocked.push(id);
+            }
+        }
+        blocked
+    }
+
+    /// 按给定 id 顺序决定某组保留谁。`pick` 返回保留的照片 id。
+    pub fn set_dup_keeper(&mut self, gid: i64, keep_id: i64) -> bool {
+        let in_group = self
+            .photo(keep_id)
+            .map(|r| r.dup_group == Some(gid) && !r.is_missing())
+            .unwrap_or(false);
+        if !in_group {
+            return false;
+        }
+        let Ok(tx) = self.conn.transaction() else {
+            return false;
+        };
+        let _ = tx.execute(
+            "UPDATE photos SET is_best=0 WHERE dup_group=?",
+            params![gid],
+        );
+        let _ = tx.execute(
+            "UPDATE photos SET is_best=1 WHERE id=?",
+            params![keep_id],
+        );
+        let keep_bytes: i64 = tx
+            .query_row(
+                "SELECT COALESCE(size,0) FROM photos WHERE id=?",
+                params![keep_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let sum: i64 = tx
+            .query_row(
+                "SELECT COALESCE(SUM(size),0) FROM photos WHERE dup_group=? AND missing=0",
+                params![gid],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let _ = tx.execute(
+            "UPDATE dup_groups SET best_id=?, keep_bytes=?, saved_bytes=? WHERE id=?",
+            params![keep_id, keep_bytes, (sum - keep_bytes).max(0), gid],
+        );
+        tx.commit().is_ok()
+    }
+
+    /// 按给定 id 删除照片（移到回收目录或直接删除）。
+    ///
+    /// `allow_whole_group` 为 false 时，同一重复组会被保下 1 张，
+    /// 防止用户手滑把整组照片删光；为 true 表示用户已明确确认，照删不误。
     pub fn delete_photos_to(
         &mut self,
         ids: &[i64],
         recycle: &Path,
         permanent: bool,
+        allow_whole_group: bool,
     ) -> CleanStats {
+        let blocked = if allow_whole_group {
+            Vec::new()
+        } else {
+            self.blocked_by_dup_guard(ids)
+        };
         let mut stats = CleanStats::default();
         for id in ids {
+            if blocked.contains(id) {
+                stats.protected += 1;
+                continue;
+            }
             let Some(r) = self.photo(*id) else {
                 stats.errors += 1;
                 continue;
@@ -1458,6 +1647,166 @@ impl Library {
         (roots_fixed, photos_fixed)
     }
 
+    /// 回收站条目：被移到回收目录、尚未取回的文件。
+    ///
+    /// 数据来源是 `ops_log` 里 `dedup_move` / `delete_move` 且 `undone=0` 的记录。
+    /// 返回 `(log_id, 原路径, 回收目录路径, 时间戳)`，按时间倒序。
+    ///
+    /// 只列出文件仍在回收目录里的条目——文件被外部删掉的记录不展示，
+    /// 否则用户点「取回」会得到「文件不存在」的失败提示。
+    pub fn recycle_entries(&self) -> Vec<(i64, String, String, f64)> {
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT id, src, dst, ts FROM ops_log \
+             WHERE kind IN ('dedup_move','delete_move') AND undone=0 \
+             ORDER BY id DESC",
+        ) else {
+            return Vec::new();
+        };
+        let Ok(it) = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                r.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+            ))
+        }) else {
+            return Vec::new();
+        };
+        it.flatten()
+            // 文件已不在了就不列出来
+            .filter(|(_, _, dst, _)| Path::new(dst).exists())
+            .collect()
+    }
+
+    /// 清理文件已不在磁盘上的回收记录（幽灵记录）。
+    /// 返回被清掉的条数。这些记录留着只会让「全部取回」莫名其妙地失败。
+    pub fn purge_ghost_recycle_entries(&self) -> usize {
+        let rows: Vec<(i64, String)> = {
+            let Ok(mut stmt) = self.conn.prepare(
+                "SELECT id, dst FROM ops_log \
+                 WHERE kind IN ('dedup_move','delete_move') AND undone=0",
+            ) else {
+                return 0;
+            };
+            let Ok(it) = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                ))
+            }) else {
+                return 0;
+            };
+            it.flatten().collect()
+        };
+        let mut cleaned = 0usize;
+        for (id, dst) in rows {
+            if !Path::new(&dst).exists() {
+                let _ = self
+                    .conn
+                    .execute("UPDATE ops_log SET undone=1 WHERE id=?", params![id]);
+                cleaned += 1;
+            }
+        }
+        cleaned
+    }
+
+    /// 从回收站取回一个文件：移回原路径并恢复索引。
+    ///
+    /// 返回 `(成功?, 最终路径, 说明)`。
+    pub fn restore_from_recycle(&mut self, log_id: i64) -> (bool, String, String) {
+        // 找到这条记录
+        let row: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT src, dst FROM ops_log WHERE id=? AND undone=0",
+                params![log_id],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                        r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    ))
+                },
+            )
+            .optional()
+            .ok()
+            .flatten();
+
+        let Some((src, dst)) = row else {
+            return (false, String::new(), "找不到这条回收记录".into());
+        };
+        let src_p = PathBuf::from(&src);
+        let dst_p = PathBuf::from(&dst);
+        if !dst_p.is_file() {
+            return (false, String::new(), "回收目录里的文件已不存在".into());
+        }
+
+        // 原路径若已被占用，加序号，绝不覆盖
+        let mut taken = std::collections::HashSet::new();
+        let target = if src_p.exists() {
+            unique_path(&src_p, &mut taken)
+        } else {
+            src_p.clone()
+        };
+        if let Some(parent) = target.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let moved = std::fs::rename(&dst_p, &target).is_ok()
+            || (std::fs::copy(&dst_p, &target).is_ok() && std::fs::remove_file(&dst_p).is_ok());
+        if !moved {
+            return (false, String::new(), "移回文件失败".into());
+        }
+
+        // 恢复索引：路径改回来、清掉 missing
+        let folder = target
+            .parent()
+            .map(|p| p.to_string_lossy().to_string());
+        let _ = self.conn.execute(
+            "UPDATE photos SET path=?, folder=?, missing=0 WHERE path=? OR path=?",
+            params![
+                target.to_string_lossy().to_string(),
+                folder,
+                dst,
+                src
+            ],
+        );
+        let _ = self
+            .conn
+            .execute("UPDATE ops_log SET undone=1 WHERE id=?", params![log_id]);
+
+        (true, target.to_string_lossy().to_string(), "已取回".into())
+    }
+
+    /// 永久删除回收站里的一个文件（不可恢复）。
+    pub fn purge_recycle(&mut self, log_id: i64) -> (bool, String) {
+        let dst: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT dst FROM ops_log WHERE id=? AND undone=0",
+                params![log_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .flatten();
+        let Some(dst) = dst else {
+            return (false, "找不到这条回收记录".into());
+        };
+        let p = PathBuf::from(&dst);
+        if p.is_file() && std::fs::remove_file(&p).is_err() {
+            return (false, "删除文件失败".into());
+        }
+        let _ = self
+            .conn
+            .execute("UPDATE ops_log SET undone=1 WHERE id=?", params![log_id]);
+        // 记录也彻底清掉，避免回收站里一直挂着
+        let _ = self
+            .conn
+            .execute("DELETE FROM photos WHERE path=?", params![dst]);
+        (true, "已永久删除".into())
+    }
+
     // -------------------------------------------------------------- 日志
 
     pub fn log_op(&mut self, kind: &str, src: &str, dst: &str, detail: &str) -> i64 {
@@ -1468,26 +1817,41 @@ impl Library {
         self.conn.last_insert_rowid()
     }
 
-    pub fn recent_ops(&self, limit: i64) -> Vec<(i64, f64, String, String, String, String)> {
-        let Ok(mut stmt) = self.conn.prepare(
-            "SELECT id,ts,kind,src,dst,detail FROM ops_log ORDER BY id DESC LIMIT ?",
-        ) else {
+    /// 归档操作日志，含源路径、目标路径和是否撤销。
+    pub fn organize_log_rows(
+        &self,
+        batch: Option<&str>,
+        only_pending: bool,
+    ) -> Vec<(i64, String, String, String, i64)> {
+        let mut sql = "SELECT id,src,dst,detail,undone FROM ops_log WHERE kind='organize'".to_string();
+        if only_pending {
+            sql.push_str(" AND undone=0");
+        }
+        sql.push_str(" ORDER BY id DESC LIMIT 10000");
+        let Ok(mut stmt) = self.conn.prepare(&sql) else {
             return Vec::new();
         };
-        let Ok(it) = stmt.query_map(params![limit], |r| {
+        let Ok(rows) = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
-                r.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
-                r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                r.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
             ))
         }) else {
             return Vec::new();
         };
-        it.flatten().collect()
+        rows.flatten()
+            .filter(|row| {
+                batch.is_none_or(|b| {
+                    let batch_part = format!("batch={b}");
+                    row.3.split(';').any(|part| part == batch_part)
+                })
+            })
+            .collect()
     }
+
 }
 
 /// 一次 upsert 要写入的字段。只填需要的字段，未填的列不会被改动。
@@ -1534,10 +1898,6 @@ impl PhotoUpdate {
         }
     }
 
-    pub fn bool(&mut self, key: &'static str, v: bool) -> &mut Self {
-        self.push(key, rusqlite::types::Value::Integer(if v { 1 } else { 0 }))
-    }
-
     /// 收集所有待写字段；`path` 始终第一个。
     fn non_empty_sets(&self) -> Vec<(&'static str, rusqlite::types::Value)> {
         let mut out = vec![(
@@ -1561,6 +1921,8 @@ pub struct CleanStats {
     pub removed: usize,
     pub errors: usize,
     pub freed: i64,
+    /// 因「整组至少保留一张」被拦下的照片数
+    pub protected: usize,
 }
 
 /// 把文件移到目标目录，重名时自动加序号。
@@ -1649,6 +2011,65 @@ mod tests {
     }
 
     #[test]
+    fn recycle_restore_moves_file_back() {
+        let dir = std::env::temp_dir().join("po_recycle_restore");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let recycle = dir.join("recycle");
+        std::fs::create_dir_all(&recycle).unwrap();
+
+        let orig = dir.join("a.jpg");
+        std::fs::write(&orig, b"photo-bytes").unwrap();
+
+        let mut l = lib();
+        let mut u = PhotoUpdate::new(orig.to_string_lossy().to_string());
+        u.text("name", Some("a.jpg")).int("size", Some(11));
+        let pid = l.upsert_photo(&u).unwrap();
+        // 走真实的删除到回收站
+        let s = l.delete_photos_to(&[pid], &recycle, false, false);
+        assert_eq!(s.moved, 1, "{s:?}");
+        assert!(!orig.exists(), "原文件应被移走");
+        assert_eq!(l.photo(pid).unwrap().missing, Some(1));
+
+        let entries = l.recycle_entries();
+        assert_eq!(entries.len(), 1);
+        let log_id = entries[0].0;
+
+        let (ok, path, msg) = l.restore_from_recycle(log_id);
+        assert!(ok, "取回失败：{msg}");
+        assert!(Path::new(&path).exists(), "文件应回到原位置");
+        assert_eq!(l.photo(pid).unwrap().missing, Some(0));
+        assert!(l.recycle_entries().is_empty(), "取回后不该再列出");
+    }
+
+    #[test]
+    fn recycle_restore_all_when_original_exists() {
+        // 原路径已被占用时，取回应改名而不是覆盖
+        let dir = std::env::temp_dir().join("po_recycle_conflict");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let recycle = dir.join("recycle");
+        std::fs::create_dir_all(&recycle).unwrap();
+
+        let orig = dir.join("b.jpg");
+        std::fs::write(&orig, b"v1").unwrap();
+        let mut l = lib();
+        let mut u = PhotoUpdate::new(orig.to_string_lossy().to_string());
+        u.text("name", Some("b.jpg"));
+        let pid = l.upsert_photo(&u).unwrap();
+        l.delete_photos_to(&[pid], &recycle, false, false);
+
+        // 用户在回收期间又在原位置放了个同名文件
+        std::fs::write(&orig, b"new-file").unwrap();
+
+        let log_id = l.recycle_entries()[0].0;
+        let (ok, path, _) = l.restore_from_recycle(log_id);
+        assert!(ok);
+        assert_ne!(path, orig.to_string_lossy().to_string(), "应改名避让");
+        assert_eq!(std::fs::read(&orig).unwrap(), b"new-file".to_vec(), "不能覆盖");
+    }
+
+    #[test]
     fn schema_creates_all_tables() {
         let l = lib();
         let mut stmt = l
@@ -1691,6 +2112,7 @@ mod tests {
         assert_eq!(row.size, Some(1234));
         assert!(!row.is_favorite());
     }
+
 
     #[test]
     fn upsert_updates_only_given_fields() {
@@ -1767,6 +2189,61 @@ mod tests {
             r"C:\a\c"
         );
         assert_eq!(normalize_path(Path::new(r"C:\a\b")).to_string_lossy(), r"C:\a\b");
+    }
+
+    #[test]
+    fn reset_index_keeps_roots_when_asked() {
+        let mut l = lib();
+        l.add_root(Path::new(r"D:\keep\me"));
+        l.upsert_photo(&mut PhotoUpdate::new(r"D:\a\1.jpg")).unwrap();
+        l.upsert_photo(&mut PhotoUpdate::new(r"D:\a\2.jpg")).unwrap();
+        assert_eq!(l.count(""), 2);
+
+        l.reset_index(true);
+        assert_eq!(l.count(""), 0, "照片记录应清空");
+        assert_eq!(l.roots().len(), 1, "目录应保留");
+    }
+
+    #[test]
+    fn reset_index_clears_roots_when_not_kept() {
+        let mut l = lib();
+        l.add_root(Path::new(r"D:\gone\dir"));
+        l.upsert_photo(&mut PhotoUpdate::new(r"D:\a\1.jpg")).unwrap();
+
+        l.reset_index(false);
+        assert_eq!(l.count(""), 0, "照片记录应清空");
+        assert!(l.roots().is_empty(), "目录也应清空");
+    }
+
+    #[test]
+    fn remove_root_only_drops_that_dir() {
+        let l = lib();
+        l.add_root(Path::new(r"D:\a"));
+        l.add_root(Path::new(r"D:\b"));
+        l.add_root(Path::new(r"D:\c"));
+        assert_eq!(l.roots().len(), 3);
+
+        l.remove_root(Path::new(r"D:\b"));
+        let roots = l.roots();
+        assert_eq!(roots.len(), 2);
+        assert!(!roots.iter().any(|r| r.ends_with(r"\b")), "{roots:?}");
+        // 其他目录不受影响
+        assert!(roots.iter().any(|r| r.ends_with(r"\a")));
+        assert!(roots.iter().any(|r| r.ends_with(r"\c")));
+    }
+
+    #[test]
+    fn remove_root_does_not_touch_photos() {
+        // 移除目录只影响 roots 表，照片记录还在（只是下次扫描不再从这个目录找）
+        let mut l = lib();
+        l.add_root(Path::new(r"D:\keep\photos"));
+        l.upsert_photo(&mut PhotoUpdate::new(r"D:\keep\photos\a.jpg"))
+            .unwrap();
+        assert_eq!(l.count(""), 1);
+
+        l.remove_root(Path::new(r"D:\keep\photos"));
+        assert!(l.roots().is_empty());
+        assert_eq!(l.count(""), 1, "移除目录不该删照片记录");
     }
 
     #[test]
@@ -1896,10 +2373,18 @@ mod tests {
     fn ops_log_appends() {
         let mut l = lib();
         l.log_op("organize", "a.jpg", "b.jpg", "batch=B1");
-        let ops = l.recent_ops(10);
-        assert_eq!(ops.len(), 1);
-        assert_eq!(ops[0].2, "organize");
-        assert!(ops[0].5.contains("batch=B1"));
+        let (kind, src, dst, detail): (String, String, String, String) = l
+            .conn
+            .query_row(
+                "SELECT kind,src,dst,detail FROM ops_log ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "organize");
+        assert_eq!(src, "a.jpg");
+        assert_eq!(dst, "b.jpg");
+        assert!(detail.contains("batch=B1"));
     }
 
     #[test]

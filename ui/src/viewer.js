@@ -2,7 +2,7 @@
    支持滚轮/按钮/键盘缩放、拖拽平移、左右切换、Esc 关闭、跳转修复。 */
 import { reactive } from 'vue'
 import { api } from './api'
-import { photoUrl } from './thumb'
+import { photoUrl, videoUrl } from './thumb'
 
 const MIN_ZOOM = 1
 const MAX_ZOOM = 6
@@ -22,12 +22,45 @@ const state = reactive({
   dragY: 0,
   dragging: false,
   gotoRestore: null,
+  /* 旋转角度（度）。仅影响显示，不改原文件；切换照片时归零。
+     注意：这里刻意【不】取模到 0-359，见 rotateBy 的说明 */
+  rotate: 0,
+  /* 为 true 时禁用 transform 过渡（切换照片/归位时用，避免长距离倒转） */
+  noTransition: false,
 })
 
 function resetZoom() {
   state.zoom = 1
   state.offsetX = 0
   state.offsetY = 0
+}
+
+/* 每次点击累加 ±90°，不取模。
+ *
+ * 为什么不能取模：转到 270° 后再点一次，`(270+90) % 360 = 0`，
+ * CSS 的 transition 会在 270deg → 0deg 之间**倒着**插值，
+ * 屏幕上就是"一下倒转三圈回到原位"，非常突兀。
+ * 让数值一直累加（360、450、540…），CSS 里 rotate(360deg) 与
+ * rotate(0deg) 视觉完全等价，所以既正确又每次只转 90°。
+ *
+ * 累加到 ±3600° 时顺手归到等价角度，避免长时间反复点击后数值无限增大。
+ */
+export function rotateBy(delta) {
+  state.rotate += delta
+  if (Math.abs(state.rotate) >= 3600) {
+    // 归到最近的等价角度，且不触发过渡（数值变化但视觉不变）
+    state.noTransition = true
+    state.rotate = state.rotate % 360
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => { state.noTransition = false })
+    })
+  }
+}
+
+/* 归位：把角度清零。
+ * 调用方负责在切换照片时设 `noTransition`，否则从 270° 回 0 会倒着抡。 */
+function resetRotate() {
+  state.rotate = 0
 }
 
 export function zoomBy(delta) {
@@ -68,7 +101,13 @@ function loadDetail() {
   state.row = row
   state.tags = []
   state.loading = true
+  // 缩放和旋转都直接归位，不要带动画（否则会从上一张的状态"滑"过来）
+  state.noTransition = true
   resetZoom()
+  resetRotate()
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => { state.noTransition = false })
+  })
   api.photo(row.id).then(r => {
     if (!r || state.row?.id !== row.id) return
     state.row = { ...row, ...r }
@@ -197,3 +236,10 @@ export function markFavorite(fav) {
 
 export const viewerState = state
 export const viewerImage = () => photoUrl(state.row)
+/* 当前这张是不是视频 */
+export const viewerIsVideo = () => state.row?.kind === 'video'
+/* 视频播放地址 */
+export const viewerVideo = () => videoUrl(state.row)
+
+/* 视频不内嵌播放：软件不带解码器（那样安装包要 60 MB+），
+   点开查看器后由界面引导用系统播放器打开。这里不再需要 blob 逻辑。 */

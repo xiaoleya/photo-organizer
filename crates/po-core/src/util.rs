@@ -15,6 +15,11 @@ pub const IMG_EXTS: &[&str] = &[
     "avif",
 ];
 
+/// 视频扩展名。这些文件会进图库，但只做抽帧/时长，不做像素质量分析。
+pub const VIDEO_EXTS: &[&str] = &[
+    "mp4", "mov", "m4v", "avi", "mkv", "wmv", "flv", "webm", "3gp", "mpg", "mpeg", "mts", "m2ts",
+];
+
 pub const RAW_EXTS: &[&str] = &["cr2", "cr3", "nef", "arw", "dng", "raf", "orf", "rw2"];
 
 /// 1826 年涅普斯第一张永久照片，作为合理下界
@@ -43,9 +48,14 @@ pub fn is_image(path: &Path) -> bool {
     IMG_EXTS.iter().any(|x| *x == e)
 }
 
-pub fn is_raw(path: &Path) -> bool {
+pub fn is_video(path: &Path) -> bool {
     let e = ext_lower(path);
-    RAW_EXTS.iter().any(|x| *x == e)
+    VIDEO_EXTS.iter().any(|x| *x == e)
+}
+
+/// 该不该进图库：照片与视频都要，RAW 暂不支持解码所以排除。
+pub fn is_media(path: &Path) -> bool {
+    is_image(path) || is_video(path)
 }
 
 /// 流式计算文件 sha1。
@@ -571,5 +581,22 @@ mod tests {
         assert!(is_image(Path::new("a.webp")));
         assert!(!is_image(Path::new("a.txt")));
         assert!(!is_image(Path::new("noext")));
+    }
+
+    #[test]
+    fn is_video_by_extension() {
+        assert!(is_video(Path::new("a.mp4")));
+        assert!(is_video(Path::new("a.MOV")));
+        assert!(is_video(Path::new("a.mkv")));
+        assert!(!is_video(Path::new("a.jpg")));
+        assert!(!is_video(Path::new("noext")));
+    }
+
+    #[test]
+    fn is_media_covers_both_but_not_raw() {
+        assert!(is_media(Path::new("a.jpg")));
+        assert!(is_media(Path::new("a.mp4")));
+        assert!(!is_media(Path::new("a.cr2")), "RAW 不进图库");
+        assert!(!is_media(Path::new("a.txt")));
     }
 }
